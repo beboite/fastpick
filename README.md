@@ -27,14 +27,40 @@ fastpick -p "hello"                          # menu, then those arguments go to 
 fastpick --harness opencode                  # skip the first screen
 fastpick --harness codex --provider acme --model acme-large    # no menu at all
 fastpick --list --provider acme              # what that provider serves right now
+fastpick --list --json                       # the same, for another program
 fastpick --dry-run                           # the exact command and environment
 fastpick --update                            # install the newest signed release
 ```
 
 Each of `--harness`, `--provider` and `--model` skips its own screen; the menu opens on the
-first one you left out. Arrows move, Enter selects, Esc goes back, Space checks a system
-prompt file, left/right changes the effort level, `tab` refetches the model list, `a` lists
-every file in the prompts folder, and typing filters.
+first one you left out.
+
+Up and down move, right goes forward, left goes back. On the model list Enter launches
+straight away: the matching system prompt file is already checked and the effort is the
+model's default, so the usual case is one key. Right opens the options panel beside the
+list, where space changes whatever the cursor is on and `a` lists every file in the prompts
+folder. `tab` refetches the model list and typing filters it.
+
+## Setting it up
+
+Run `fastpick` once: it writes a starter config and stops, because the providers it ships
+are examples rather than endpoints. Editing that file is the whole configuration.
+
+```
+fastpick --edit             # opens it in $VISUAL, $EDITOR, or your platform's default
+fastpick --set-key acme     # prompts, does not echo, writes owner-only
+fastpick --paths            # where everything lives, and who can read each key file
+```
+
+[`config.example.toml`](./config.example.toml) is that file, commented block by block:
+harnesses, providers, per-harness bindings, model catalogues, local proxies, host checks.
+Only the harnesses whose binary is on this machine are offered, so one config can follow you
+across machines that do not have the same agents installed.
+
+Paths accept `~`, `$VAR` and `%VAR%`. Keys are referenced by file path, never inlined, and
+never reach a config file, a command line or a log. Every variable an adapter owns is either
+set or removed, so picking a third-party endpoint clears `ANTHROPIC_API_KEY` instead of
+sending it there.
 
 ## Harnesses
 
@@ -48,16 +74,6 @@ Nothing writes to your agents' own config files, and OpenCode's inline config is
 `opencode.json` rather than replacing it. Codex gets no system prompt row because its
 instructions override replaces the base prompt, tool rules included: swapping an agent's own
 prompt for yours is not something to do quietly.
-
-## Config
-
-Written to `%APPDATA%\fastpick\config.toml` or `~/.config/fastpick/config.toml` on first
-run. [`config.example.toml`](./config.example.toml) is that file, commented block by block:
-providers, per-harness bindings, model catalogues, local proxies, host checks.
-
-Keys are referenced by file path, never inlined, and never reach a config file or a command
-line. Every variable an adapter owns is either set or removed, so picking a third-party
-endpoint clears `ANTHROPIC_API_KEY` instead of sending it there.
 
 Two Claude Code behaviours the config works around, both easy to get wrong by hand:
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` does nothing for `claude-*` models, so fastpick refuses to

@@ -6,6 +6,14 @@
 # put it: their values are printed in full by `--dry-run`, which is the output people paste
 # into bug reports.
 #
+#   fastpick --edit           open this file
+#   fastpick --paths          every path fastpick uses, and the state of each key file
+#   fastpick --set-key <id>   write a provider's key, read from stdin, owner-only
+#   fastpick --list           what this file declares, and what is installed
+#
+# Paths take ~, $VAR and %VAR%, so the same file works on Windows, macOS and Linux. Only
+# the harnesses whose `bin` is installed are offered by the menu.
+#
 # Two kinds of block, and the menu asks for them in this order.
 #
 #   [[harness]]   a coding agent binary. `kind` picks the built-in adapter that knows how
@@ -64,7 +72,6 @@ bin = "codex"
 #
 #   extra_args = ["--verbose"]   appended to every launch of this harness, whatever the
 #                                provider. A per-provider equivalent lives on the binding.
-#   note = "..."                 one line shown under the name in the menu.
 #
 # `bin` may be a bare name resolved through PATH, or a path. On Windows the npm shim is
 # found and run correctly either way, including the .cmd one that CreateProcess refuses.
@@ -80,7 +87,6 @@ bin = "codex"
 id = "builtin"
 name = "Built in (the agent's own login)"
 group = "native"
-note = "nothing overridden"
 
   [provider.harness.claude-code]
   [provider.harness.codex]
@@ -90,7 +96,6 @@ note = "nothing overridden"
   [[provider.model]]
   id = "claude-opus-5[1m]"
   label = "Opus 5"
-  note = "1M window"
   effort = ["low", "medium", "high", "xhigh", "max"]
   effort_default = "high"
   # No context_window, here or on any claude-* model: Claude Code ignores
@@ -173,12 +178,12 @@ small_fast_model = "example-small"
 id = "example-proxied"
 name = "Example through a local proxy"
 group = "example.invalid"
-note = "starts a proxy on demand"
 auth_token_file = "~/.some-proxy/client.key"
 
   [provider.proxy]
   port = 4000
-  exe = "~/.some-proxy/proxy.exe"
+  # Add the platform's extension if it has one, this is spawned as written.
+  exe = "~/.some-proxy/proxy"
   args = ["-config", "~/.some-proxy/config.yaml"]
   workdir = "~/.some-proxy"
   timeout_secs = 15

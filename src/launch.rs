@@ -152,7 +152,19 @@ fn token_of(p: &Provider) -> Result<Option<String>> {
     };
     let path = expand(keyfile);
     if !path.exists() {
-        return Err(anyhow!("{}: missing key file {}", p.name, path.display()));
+        return Err(anyhow!(
+            "{}: missing key file {}. `fastpick --set-key {}` writes it",
+            p.name,
+            path.display(),
+            p.id
+        ));
+    }
+    // Said once, at the moment the file is actually read, and never fatal: refusing to
+    // launch over a permission bit would be fastpick deciding something that is the
+    // owner's call.
+    let access = crate::secrets::access(&path);
+    if access.is_problem() {
+        eprintln!("fastpick: {} is {}", path.display(), access.label());
     }
     Ok(Some(read_token(&path)?))
 }

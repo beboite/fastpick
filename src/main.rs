@@ -8,15 +8,17 @@
 
 mod catalog;
 mod config;
+mod json;
 mod launch;
 mod paths;
 mod prompts;
+mod secrets;
 mod state;
 mod tui;
 mod update;
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const HELP: &str = "\
@@ -27,8 +29,13 @@ USAGE
 
 OPTIONS
   -c, --config <file>    config file to use (default: the per-user one, see PATHS)
+  -e, --edit             open the config in $VISUAL, $EDITOR or the system default
   -l, --list             print the harnesses, providers and models, then exit
+      --paths            print every path fastpick uses and the state of each key file
+      --set-key <id>     read a key from stdin and write it to that provider's key file,
+                         owner-readable. Never pass a key as an argument
   -n, --dry-run          show the command and environment a launch would use, run nothing
+      --json             print --list or --dry-run as JSON instead, for another program
   -r, --refresh          refetch the model catalogue instead of using the cached one
       --harness <id>     skip the harness screen
       --provider <id>    skip the provider screen
@@ -46,17 +53,27 @@ first one you left out. Anything not recognised is forwarded to the agent, so
 `fastpick -p \"hello\"` works. Use `--` when an argument would otherwise be read as a
 fastpick option.
 
+Under --json, exit code 0 means stdout holds one JSON document and nothing else; every
+notice and every error goes to stderr. `--list --json` describes the config without
+touching the network, and adding --provider <id> also lists that provider's models.
+No credential is ever printed, in either mode.
+
+Only the harnesses whose binary is installed are offered. --harness names one anyway.
+
 KEYS
-  up/down   move             enter   select / launch
-  esc       back             space   check a system prompt file
+  up/down   move             right   next screen, or the options panel on a model
+  left      back             enter   launch
+  space     change the row under the cursor in the options panel
   tab       refetch the model catalogue for this provider
   a         list every file in the prompts folder, not only the ones matching the model
   type      filter the model list
 
 PATHS
-  config    %APPDATA%\\fastpick\\config.toml, or ~/.config/fastpick/config.toml
+  config    %APPDATA%\\fastpick\\config.toml, or $XDG_CONFIG_HOME/fastpick/config.toml,
+            or ~/.config/fastpick/config.toml
   catalog   <config dir>/catalog/, one JSON per provider, refreshed on a timer
   prompts   whatever `system_prompts_dir` points at, `<config dir>/system-prompts` by default
+  keys      whatever each provider's `auth_token_file` points at. Run --paths to see them
 ";
 
 fn main() -> ExitCode {
@@ -72,8 +89,12 @@ fn main() -> ExitCode {
 #[derive(Default)]
 struct Args {
     config: Option<PathBuf>,
+    edit: bool,
+    paths: bool,
+    set_key: Option<String>,
     list: bool,
     dry_run: bool,
+    json: bool,
     refresh: bool,
     harness: Option<String>,
     provider: Option<String>,
@@ -101,8 +122,12 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
             "-c" | "--config" => {
                 args.config = Some(PathBuf::from(it.next().ok_or("--config needs a file")?));
             }
+            "-e" | "--edit" => args.edit = true,
+            "--paths" => args.paths = true,
+            "--set-key" => args.set_key = Some(it.next().ok_or("--set-key needs a provider id")?),
             "-l" | "--list" => args.list = true,
             "-n" | "--dry-run" => args.dry_run = true,
+            "--json" => args.json = true,
             "-r" | "--refresh" => args.refresh = true,
             "--harness" => args.harness = Some(it.next().ok_or("--harness needs an id")?),
             "--provider" => args.provider = Some(it.next().ok_or("--provider needs an id")?),
@@ -203,6 +228,12 @@ fn real_main() -> Result<i32> {
         return Ok(0);
     };
 
+    // A JSON menu is not a thing, so the flag only means something once a mode that
+    // already prints rather than launches has been asked for.
+    if args.json && !args.list && !args.dry_run {
+        anyhow::bail!("--json describes a run rather than opening one: add --list or --dry-run");
+    }
+
     // Whatever the last `--update` could not delete while it was running.
     update::sweep_leftovers();
 
@@ -218,13 +249,36 @@ fn real_main() -> Result<i32> {
     };
 
     if config::ensure_config(&cfg_path)? {
+        // Under --json this is a failure, not a notice: the starter config declares
+        // example providers, and a caller has nothing to consume from them.
+        if args.json {
+            anyhow::bail!(
+                "a starter config was written at {}. Edit it, then ask again",
+                cfg_path.display()
+            );
+        }
         println!("fastpick wrote a starter config at {}", cfg_path.display());
         println!("Edit it, then run fastpick again. It ships one block per kind of harness");
         println!("and per kind of provider, each commented.");
         return Ok(0);
     }
 
+    // Before the parse on purpose: a config that no longer loads is exactly when opening it
+    // in an editor is the thing you want.
+    if args.edit {
+        return edit(&cfg_path);
+    }
+
     let cfg = config::Config::load(&cfg_path)?;
+
+    if args.paths {
+        print_paths(&cfg, &cfg_path);
+        return Ok(0);
+    }
+
+    if let Some(id) = &args.set_key {
+        return set_key(&cfg, id);
+    }
 
     // Before `--list`, not after. Listing used to run first, so `--list --provider typo`
     // printed the whole catalogue and exited 0 as though the id had been honoured.
@@ -240,7 +294,12 @@ fn real_main() -> Result<i32> {
     }
 
     if args.list {
-        print_list(&cfg, &args)?;
+        if args.json {
+            let listing = json::listing(&cfg, &cfg_path, args.provider.as_deref(), args.refresh)?;
+            json::print(&listing)?;
+        } else {
+            print_list(&cfg, &args)?;
+        }
         return Ok(0);
     }
 
@@ -248,12 +307,20 @@ fn real_main() -> Result<i32> {
 
     // A flag names a thing and skips its screen. The saved state only moves the cursor.
     let harness_idx = match &args.harness {
-        Some(id) => Some(
-            cfg.harnesses
+        Some(id) => {
+            let idx = cfg
+                .harnesses
                 .iter()
                 .position(|h| &h.id == id)
-                .with_context(|| format!("no harness with id `{id}`, see --list"))?,
-        ),
+                .with_context(|| format!("no harness with id `{id}`, see --list"))?;
+            // Named explicitly, so it runs even when the binary was not found. A warning
+            // rather than a refusal: the detection can be wrong, the flag cannot.
+            let bin = &cfg.harnesses[idx].bin;
+            if paths::locate(bin).is_none() {
+                eprintln!("fastpick: `{bin}` is not on PATH, launching it anyway");
+            }
+            Some(idx)
+        }
         None => saved
             .last_harness
             .as_ref()
@@ -323,7 +390,11 @@ fn real_main() -> Result<i32> {
     };
 
     if args.dry_run {
-        print_dry_run(&cfg, &sel)?;
+        if args.json {
+            json::print(&json::dry_run(&cfg, &sel)?)?;
+        } else {
+            print_dry_run(&cfg, &sel)?;
+        }
         return Ok(0);
     }
 
@@ -401,13 +472,153 @@ fn resolve_prompts(
     Ok(out)
 }
 
+/// Opens the config in the user's editor.
+///
+/// `$VISUAL` and `$EDITOR` are command lines rather than program names (`code -w`,
+/// `vim -p`), so the first word is the program and the rest are arguments. Without either,
+/// the platform's own way of opening a text file is used, and on Linux there is no such
+/// thing, so a couple of editors that are always there are tried before giving up.
+fn edit(path: &Path) -> Result<i32> {
+    let named = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok())
+        .filter(|e| !e.trim().is_empty());
+
+    // `.cmd` throughout: `program` also reports whether a `cmd.exe` sits in front, which
+    // matters for the launch path but not here, where the only argument is a path we chose.
+    let mut cmd = match &named {
+        Some(line) => {
+            let mut parts = line.split_whitespace();
+            let prog = parts.next().unwrap_or("");
+            let mut c = paths::program(prog).cmd;
+            for a in parts {
+                c.arg(a);
+            }
+            c
+        }
+        None if cfg!(windows) => paths::program("notepad").cmd,
+        None if cfg!(target_os = "macos") => {
+            let mut c = paths::program("open").cmd;
+            c.arg("-t");
+            c
+        }
+        None => {
+            let found = ["nano", "vi"].iter().find(|b| paths::locate(b).is_some());
+            match found {
+                Some(b) => paths::program(b).cmd,
+                None => anyhow::bail!(
+                    "no editor found: set $EDITOR, or open {} yourself",
+                    path.display()
+                ),
+            }
+        }
+    };
+
+    let status = cmd
+        .arg(path)
+        .status()
+        .with_context(|| format!("opening {}", path.display()))?;
+    Ok(status.code().unwrap_or(0))
+}
+
+/// Every path fastpick reads or writes, and the state of each key file.
+fn print_paths(cfg: &config::Config, cfg_path: &Path) {
+    let dir = config::config_dir();
+    let show = |p: Option<PathBuf>| {
+        p.map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no config directory on this system)".into())
+    };
+    println!("config    {}", cfg_path.display());
+    println!("prompts   {}", show(cfg.prompts_dir()));
+    println!(
+        "catalog   {}",
+        show(dir.as_ref().map(|d| d.join("catalog")))
+    );
+    println!(
+        "state     {}",
+        show(dir.as_ref().map(|d| d.join("state.toml")))
+    );
+
+    println!("\nharnesses");
+    for h in &cfg.harnesses {
+        match paths::locate(&h.bin) {
+            Some(p) => println!("  {}  [{}]  {}", h.name, h.id, p.display()),
+            None => println!("  {}  [{}]  {} is not installed", h.name, h.id, h.bin),
+        }
+    }
+
+    // The path and the verdict, never the contents. Somebody reading this over a shoulder
+    // learns where the key is, which they would learn from the config anyway.
+    println!("\nkeys");
+    for p in &cfg.providers {
+        match &p.auth_token_file {
+            None => println!("  {}  [{}]  the agent's own login", p.name, p.id),
+            Some(f) => {
+                let path = paths::expand(f);
+                let access = secrets::access(&path);
+                println!(
+                    "  {}  [{}]  {}  {}{}",
+                    p.name,
+                    p.id,
+                    path.display(),
+                    access.label(),
+                    match access {
+                        secrets::Access::Missing => format!("  (fastpick --set-key {})", p.id),
+                        _ => String::new(),
+                    }
+                );
+            }
+        }
+    }
+}
+
+/// Writes one provider's key, read from stdin so it never reaches a shell history.
+fn set_key(cfg: &config::Config, id: &str) -> Result<i32> {
+    let p = cfg
+        .providers
+        .iter()
+        .find(|p| p.id == id)
+        .with_context(|| format!("no provider with id `{id}`, see --list"))?;
+
+    let Some(file) = &p.auth_token_file else {
+        anyhow::bail!(
+            "provider `{id}` declares no auth_token_file, so it has nowhere to keep a key. \
+             Give it one in the config, then run this again"
+        );
+    };
+
+    let path = paths::expand(file);
+    let secret = secrets::read_secret(&format!("Key for {} (not shown): ", p.name))?;
+    secrets::write(&path, &secret)?;
+    println!(
+        "{}: key written to {}, {}",
+        p.name,
+        path.display(),
+        secrets::access(&path).label()
+    );
+    Ok(0)
+}
+
 fn print_list(cfg: &config::Config, args: &Args) -> Result<()> {
     for h in &cfg.harnesses {
-        println!("{}  [{}]  {}", h.name, h.id, h.bin);
+        // --list is the diagnostic view, so a harness that is not installed is shown and
+        // labelled rather than hidden the way the menu hides it.
+        let installed = match paths::locate(&h.bin) {
+            Some(_) => String::new(),
+            None => "  (not installed)".to_string(),
+        };
+        println!("{}  [{}]  {}{}", h.name, h.id, h.bin, installed);
         let mut group: Option<&str> = None;
-        for &pi in &cfg.providers_for(&h.id) {
+        for (row, &pi) in cfg.providers_for(&h.id).iter().enumerate() {
             let p = &cfg.providers[pi];
-            if p.group.as_deref() != group {
+            // Same rule as the menu: a change of group opens a block, separated by a blank
+            // line, and the heading is printed only when there is one. Without the blank
+            // line an ungrouped provider keeps the indentation of the block above it and
+            // reads as belonging to a heading that is not its own.
+            if p.group.as_deref() != group || row == 0 {
+                if row > 0 {
+                    println!();
+                }
                 if let Some(g) = p.group.as_deref() {
                     println!("  {g}");
                 }

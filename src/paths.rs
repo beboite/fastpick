@@ -13,7 +13,15 @@ use std::process::Command;
 /// in the error message. A `~` with no home directory to expand it against is left alone
 /// for the same reason, and surfaces in the "missing key file ~/..." the caller reports.
 pub fn expand(raw: &str) -> PathBuf {
-    let s = expand_unix_style(&expand_windows_style(raw));
+    let mut s = expand_unix_style(&expand_windows_style(raw));
+
+    // `~/.acme/key` on Windows would otherwise resolve to `C:\Users\me/.acme/key`, which
+    // works everywhere but is printed back to the user in error messages and by --paths.
+    // Anything holding a scheme is left alone: proxy arguments go through here too, and a
+    // URL is not a path. Before the tilde, so the joined half is normalised too.
+    if cfg!(windows) && !s.contains("://") {
+        s = s.replace('/', "\\");
+    }
 
     if s == "~" || s.starts_with("~/") || s.starts_with("~\\") {
         if let Some(home) = dirs::home_dir() {
@@ -57,7 +65,7 @@ pub fn program(bin: &str) -> Program {
     } else {
         // The expanded name, not the raw one: `bin = "%MY_AGENT%"` is a name to resolve
         // after substitution, and searching PATH for the literal `%MY_AGENT%` never hits.
-        which(&expanded.to_string_lossy())
+        find(&expanded.to_string_lossy())
     };
 
     let path = match found {
@@ -104,11 +112,23 @@ pub fn program(bin: &str) -> Program {
 /// which fails with a message about the image rather than about the lookup.
 const RUNNABLE_EXTS: [&str; 4] = [".com", ".exe", ".bat", ".cmd"];
 
+/// Where a harness binary actually is, or `None` when it is not installed.
+///
+/// A name holding a separator is a path the user chose and is checked as written; a bare
+/// name is looked up on PATH the same way the launch will, expanded name included.
+pub fn locate(bin: &str) -> Option<PathBuf> {
+    let expanded = expand(bin);
+    if bin.contains('/') || bin.contains('\\') {
+        return expanded.is_file().then_some(expanded);
+    }
+    find(&expanded.to_string_lossy())
+}
+
 /// The first match for `bin` on PATH, trying PATHEXT extensions before the bare name.
 ///
 /// Extensions come first on purpose: npm leaves an extensionless shell script beside the
 /// `.cmd`, and picking that one up would hand a bash script to CreateProcess.
-fn which(bin: &str) -> Option<PathBuf> {
+fn find(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let exts: Vec<String> = if cfg!(windows) {
         let listed: Vec<String> = std::env::var("PATHEXT")
@@ -256,7 +276,7 @@ mod tests {
         assert!(!p.via_shell);
 
         // Every npm-installed agent is a .cmd, which CreateProcess cannot run on its own.
-        let Some(shim) = which("npm") else { return };
+        let Some(shim) = find("npm") else { return };
         if shim
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("cmd"))
@@ -286,7 +306,7 @@ mod tests {
     fn an_extension_beats_the_extensionless_shell_script_beside_it() {
         // npm leaves three files per binary: `npm`, `npm.cmd` and `npm.ps1`. The first is a
         // bash script, and picking it would hand shell source to CreateProcess.
-        let Some(found) = which("npm") else { return };
+        let Some(found) = find("npm") else { return };
         assert!(
             found.extension().is_some(),
             "resolved the extensionless shim: {}",
@@ -300,7 +320,7 @@ mod tests {
         // `.ps1` is in many users' PATHEXT and npm writes one beside every `.cmd`, but
         // CreateProcess cannot run it and `cmd /c` cannot either.
         for name in ["npm", "npx"] {
-            if let Some(found) = which(name) {
+            if let Some(found) = find(name) {
                 let ext = found
                     .extension()
                     .map(|e| e.to_string_lossy().to_lowercase())
