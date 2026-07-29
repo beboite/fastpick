@@ -20,14 +20,14 @@ const CHECK_EVERY_SECS: u64 = 24 * 60 * 60;
 
 /// The minisign public key every release asset is signed with.
 ///
-/// Empty until the key pair exists. While it is empty `--update` refuses to install rather
-/// than falling back to "https was probably fine": an unverified binary that replaces this
-/// one is the whole attack, and a soft failure here would be the wrong default forever.
+/// The matching secret key lives only in the `MINISIGN_SECRET_KEY` repository secret. If it
+/// is ever rotated, this line has to move in the same commit: the release workflow verifies
+/// its own signatures against whatever it finds here, so a mismatch fails the release
+/// instead of every user's `--update` at once.
 ///
-/// Generate with `minisign -G -p fastpick.pub -s fastpick.key`, paste the second line of
-/// `fastpick.pub` here, and put the contents of `fastpick.key` in the repository secret
-/// `MINISIGN_SECRET_KEY` (with its password in `MINISIGN_PASSWORD`).
-const PUBLIC_KEY: &str = "";
+/// Left empty, `--update` refuses to install rather than falling back to "https was
+/// probably fine": an unverified binary that replaces this one is the whole attack.
+const PUBLIC_KEY: &str = "RWTTokipyMQlah79rQfCXBmJVf9sxl5K/1d529eO3OZiprBZV7qQ3daZ";
 
 /// The asset this build would install, named after the target it was compiled for.
 ///
@@ -266,9 +266,8 @@ fn download(url: &str, limit: usize) -> Result<Vec<u8>> {
 /// Refuses rather than warns when no key is compiled in. An update path that installs
 /// unverified bytes is worth less than no update path at all.
 fn verify(bytes: &[u8], signature: &str) -> Result<()> {
-    // Clippy is right that the test below is constant, and it is constant the wrong way
-    // round today: the key is still empty. Filling `PUBLIC_KEY` in turns this into the
-    // dead branch it is meant to be, and the allow can go with it.
+    // Constant today, and clippy says so. Kept anyway: a build that ships an empty key has
+    // to fail loudly here rather than inherit whatever the next edit to the constant does.
     #[allow(clippy::const_is_empty)]
     if PUBLIC_KEY.is_empty() {
         return Err(anyhow!(
@@ -426,15 +425,29 @@ mod tests {
         }
     }
 
+    /// A signature the real release key made over `SAMPLE`, in the exact shape the workflow
+    /// writes: `minisign -S`, so prehashed, so the same algorithm a release asset gets.
+    const SAMPLE: &[u8] = b"fastpick release key check\n";
+    const SAMPLE_SIG: &str = concat!(
+        "untrusted comment: signature from minisign secret key\n",
+        "RUTTokipyMQlajs4sgPorrMNuEwOC43z8ceKSR+B7qXWE3YVol5s4p1F5kG0pqhJloeJCFGaSatiVaG5XBEDtuAnCLFzdsp5zgo=\n",
+        "trusted comment: timestamp:1785329324\tfile:sample.bin\thashed\n",
+        "VNT3mLvKkrlV1UiVAHdORwDMKAupSo/vaamJmYO0SWMVI2Js1qNZ5Ql4mbgclnn5Xpgc87gfT0Ofo1i/wToqAA==\n",
+    );
+
     #[test]
-    fn an_unsigned_build_refuses_to_install_rather_than_trusting_https() {
-        // Guards the constant above: filling it in is a deliberate act, and until then the
-        // failure has to be loud rather than a silent fallback.
-        #[allow(clippy::const_is_empty)]
-        if PUBLIC_KEY.is_empty() {
-            let e = verify(b"whatever", "untrusted comment\nnot-a-signature\n").unwrap_err();
-            assert!(e.to_string().contains("signing key"), "{e}");
-        }
+    fn the_compiled_in_key_accepts_what_the_release_key_signed() {
+        // A typo in `PUBLIC_KEY`, or a rotation that only lands in the repository secret,
+        // would otherwise surface on the first user to run --update: as an update that can
+        // never install, from a release that looked fine.
+        verify(SAMPLE, SAMPLE_SIG).expect("PUBLIC_KEY does not match the release signing key");
+    }
+
+    #[test]
+    fn a_signature_over_other_bytes_is_refused() {
+        // The half that matters: a valid signature, lifted onto a different payload.
+        let e = verify(b"not what was signed", SAMPLE_SIG).unwrap_err();
+        assert!(e.to_string().contains("not signed by"), "{e}");
     }
 
     #[test]

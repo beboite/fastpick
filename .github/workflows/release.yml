@@ -136,7 +136,9 @@ jobs:
         run: |
           umask 077
           key="$(mktemp)"
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          # tr because a key pasted from a Windows machine carries CRLF, and minisign reads
+          # the base64 line whole: the \r would land inside it and fail as a bad key.
+          printf '%s\n' "$MINISIGN_SECRET_KEY" | tr -d '\r' > "$key"
           trap 'shred -u "$key" 2>/dev/null || rm -f "$key"' EXIT
           cd dist
           for f in fastpick-*; do
