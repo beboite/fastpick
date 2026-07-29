@@ -3,6 +3,7 @@
 
 <p align="center">
   <a href="https://github.com/beboite/fastpick/releases"><img src="https://img.shields.io/github/v/release/beboite/fastpick?display_name=tag" alt="Release" /></a>
+  <a href="https://crates.io/crates/fastpick"><img src="https://img.shields.io/crates/v/fastpick?logo=rust" alt="crates.io" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/github/license/beboite/fastpick" alt="License" /></a>
   <a href="https://github.com/beboite/fastpick/stargazers"><img src="https://img.shields.io/github/stars/beboite/fastpick" alt="Stars" /></a>
   <a href="https://github.com/beboite/fastpick/issues"><img src="https://img.shields.io/github/issues/beboite/fastpick" alt="Issues" /></a>
@@ -16,8 +17,13 @@ all: it is fetched from the provider.
 
 ## Install
 
-Grab the binary for your platform from [Releases](https://github.com/beboite/fastpick/releases),
-make it executable and put it on your PATH. It is self-contained.
+```bash
+cargo install fastpick
+```
+
+Or take the signed binary for your platform from
+[Releases](https://github.com/beboite/fastpick/releases), make it executable and put it on
+your PATH. It is self-contained either way.
 
 ## Use
 
