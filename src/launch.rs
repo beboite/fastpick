@@ -42,6 +42,9 @@ pub struct Selection<'a> {
 struct Builder {
     cmd: Command,
     args: Vec<OsString>,
+    /// Only ever read on Windows, where it decides between `cmd.exe` quoting and the C
+    /// runtime rules. Kept unconditionally so `finish` has one shape on every platform.
+    #[cfg_attr(not(windows), allow(dead_code))]
     via_shell: bool,
 }
 
