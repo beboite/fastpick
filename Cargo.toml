@@ -1,6 +1,6 @@
 [package]
 name = "fastpick"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Terminal picker that chooses a coding harness, a provider and a model, then launches it with the right environment"
