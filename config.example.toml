@@ -1,0 +1,186 @@
+# fastpick config
+#
+# Written to your config directory on first run and yours to edit. Nothing here is a
+# secret: keys are referenced by file path, never inlined.
+#
+# Two kinds of block, and the menu asks for them in this order.
+#
+#   [[harness]]   a coding agent binary. `kind` picks the built-in adapter that knows how
+#                 to hand it an endpoint, a model and extra instructions.
+#   [[provider]]  an endpoint. It lists the harnesses it can serve under
+#                 [provider.harness.<harness id>], and only shows up for those. Its
+#                 optional `group` is a heading in the menu: entries sharing one are drawn
+#                 as a block, which is how two keys on the same site stop looking like two
+#                 unrelated choices. Keep them next to each other here, the menu follows
+#                 this file's order.
+#
+# Models are not listed here. Each provider is asked what it serves through
+# [provider.catalog], the answer is cached, and [[provider.model]] below only layers on
+# what no API reports: a nicer name, a context window, effort levels, or an id that works
+# but is not advertised.
+
+system_prompts_dir = "~/.config/fastpick/system-prompts"
+
+# How long a fetched catalogue stays fresh. `tab` in the menu refetches on demand.
+catalog_ttl_secs = 21600
+
+
+# ============================================================================ harnesses
+
+[[harness]]
+id = "claude-code"
+name = "Claude Code"
+kind = "claude-code"
+bin = "claude"
+# Takes an endpoint through environment variables, a model through --model, an effort
+# level through --effort, and appends instructions with --append-system-prompt-file.
+
+[[harness]]
+id = "opencode"
+name = "OpenCode"
+kind = "opencode"
+bin = "opencode"
+# Takes everything as one inline JSON config in OPENCODE_CONFIG_CONTENT, which is merged
+# over your own opencode.json rather than replacing it, so your MCP servers, plugins and
+# agents are untouched. Extra instructions go in its `instructions` array, which appends.
+
+[[harness]]
+id = "codex"
+name = "Codex"
+kind = "codex"
+bin = "codex"
+# Takes dotted TOML overrides with -c, so ~/.codex/config.toml is never written to.
+# No system prompt row: Codex has no append-only surface for one, and its instructions
+# override would replace the base prompt, tool rules included.
+
+
+# ============================================================================= providers
+
+# --------------------------------------------------------------------------- native
+# The agent's own endpoint and login. Declaring a binding with no base_url is what says
+# "change nothing", and it is not the same as leaving the binding out, which would hide
+# this provider from that harness entirely.
+[[provider]]
+id = "builtin"
+name = "Built in (the agent's own login)"
+group = "native"
+note = "nothing overridden"
+
+  [provider.harness.claude-code]
+  [provider.harness.codex]
+
+  # No [provider.catalog]: there is no key here to authenticate a listing with, so the
+  # models below are the whole list.
+  [[provider.model]]
+  id = "claude-opus-5[1m]"
+  label = "Opus 5"
+  note = "1M window"
+  effort = ["low", "medium", "high", "xhigh", "max"]
+  effort_default = "high"
+  # No context_window, here or on any claude-* model: Claude Code ignores
+  # CLAUDE_CODE_MAX_CONTEXT_TOKENS for those names and reads its own table, so the id is
+  # the only lever on the window and declaring the variable would be a lie.
+
+  [[provider.model]]
+  id = "claude-sonnet-5"
+  label = "Sonnet 5"
+  effort = ["low", "medium", "high", "xhigh"]
+  effort_default = "high"
+
+
+# --------------------------------------------------------------------------- direct
+# A reseller that speaks the Anthropic wire format on /v1/messages and the OpenAI one on
+# /v1/chat/completions. Reachable from all three agents, each through its own dialect.
+[[provider]]
+id = "example"
+name = "Example provider"
+group = "example.invalid"
+auth_token_file = "~/.example/client.key"
+# Claude Code draws its background model (agent inspection, resumes, titles, subagents
+# with no `model:`) from ANTHROPIC_SMALL_FAST_MODEL and defaults it to claude-sonnet-5.
+# Any endpoint that does not serve that name rejects those calls, and a resume then dies
+# with "Content block not found". OpenCode reads the same setting from `small_model`.
+small_fast_model = "example-small"
+
+  [provider.catalog]
+  url = "https://example.invalid/v1/models"
+  auth = "bearer"                      # bearer | x-api-key | none
+  only_prefixes = []                   # keep only ids starting with one of these
+  exclude_contains = ["embed", "image"] # drop what an agent cannot drive
+
+  [provider.harness.claude-code]
+  base_url = "https://example.invalid"
+
+  [provider.harness.opencode]
+  base_url = "https://example.invalid/v1"
+  # Which AI SDK package speaks this endpoint: @ai-sdk/anthropic, @ai-sdk/openai-compatible
+  # for /v1/chat/completions, or @ai-sdk/openai for /v1/responses.
+  npm = "@ai-sdk/openai-compatible"
+
+  # Codex only speaks the OpenAI Responses API: it refuses a provider config saying
+  # `wire_api = "chat"` outright, so an endpoint that offers only /v1/chat/completions
+  # cannot be bound here at all. Leave the binding out rather than writing one that fails
+  # at launch.
+  [provider.harness.codex]
+  base_url = "https://example.invalid/v1"
+  wire_api = "responses"
+
+  # Layered on the fetched catalogue. Everything is optional.
+  [[provider.model]]
+  id = "example-large"
+  label = "Example Large"
+  context_window = 1000000
+  compact_ratio = 0.9
+
+
+# --------------------------------------------------------------------------- proxied
+# For an endpoint that refuses the dialect your agent speaks: a local translator listens,
+# and fastpick starts it if the port is free. Nothing runs when this provider is not used.
+#
+# Same `group` as the entry above because it is the same site, reached the long way round.
+[[provider]]
+id = "example-proxied"
+name = "Example through a local proxy"
+group = "example.invalid"
+note = "starts a proxy on demand"
+auth_token_file = "~/.some-proxy/client.key"
+
+  [provider.proxy]
+  port = 4000
+  exe = "~/.some-proxy/proxy.exe"
+  args = ["-config", "~/.some-proxy/config.yaml"]
+  workdir = "~/.some-proxy"
+  timeout_secs = 15
+  logs_hint = "~/.some-proxy/logs/"
+
+  [provider.catalog]
+  url = "http://127.0.0.1:4000/v1/models"
+
+  [provider.harness.claude-code]
+  base_url = "http://127.0.0.1:4000"
+
+
+# ----------------------------------------------------------------------------- local
+# A model served by a host that is not always reachable. `on_down` decides what an
+# unreachable host means: "warn" prints the message and launches anyway, "abort" refuses.
+# Pick "warn" only when something between you and the host can bring it back on its own.
+[[provider]]
+id = "example-local"
+name = "Local model"
+group = "local"
+auth_token_file = "~/.fastpick/local.key"
+small_fast_model = "local-model"
+
+  [provider.host_check]
+  host = "127.0.0.1"
+  on_down = "abort"
+  message = "The host does not answer. Start it, then retry."
+
+  [provider.harness.claude-code]
+  base_url = "http://127.0.0.1:8080"
+
+  [[provider.model]]
+  id = "local-model"
+  context_window = 262144
+  # A self-hosted server may divide its configured window across concurrent slots. Declare
+  # what one session actually gets, not the number in the server's command line.
