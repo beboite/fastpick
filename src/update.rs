@@ -261,6 +261,30 @@ fn download(url: &str, limit: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The one release asset holding every signature, keyed by the file it signs.
+///
+/// One manifest rather than a `.minisig` beside each binary: five targets would otherwise
+/// double the release page, and nothing but this code ever reads one.
+const SIGNATURES: &str = "SIGNATURES.json";
+
+/// Pulls this platform's signature out of the manifest.
+///
+/// An asset missing from it is refused rather than downloaded unverified: a release built
+/// before a target existed, or one whose signing step half failed, is exactly the case
+/// where "install it anyway" would be wrong.
+fn signature_for(manifest: &[u8], asset: &str) -> Result<String> {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(manifest).context("the signature manifest is not JSON")?;
+    parsed
+        .get("signatures")
+        .and_then(|s| s.get(asset))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            anyhow!("`{asset}` has no signature in {SIGNATURES}, refusing to install it")
+        })
+}
+
 /// Checks the release signature over the downloaded bytes.
 ///
 /// Refuses rather than warns when no key is compiled in. An update path that installs
@@ -314,13 +338,13 @@ pub fn run() -> Result<i32> {
 
     let bin_url = asset_url(&release, asset)
         .ok_or_else(|| anyhow!("release {tag} has no `{asset}`, so there is nothing to install"))?;
-    let sig_url = asset_url(&release, &format!("{asset}.minisig"))
-        .ok_or_else(|| anyhow!("release {tag} ships `{asset}` unsigned, refusing to install it"))?;
+    let manifest_url = asset_url(&release, SIGNATURES).ok_or_else(|| {
+        anyhow!("release {tag} ships no `{SIGNATURES}`, so nothing about it can be verified. Install it by hand from https://github.com/{REPO}/releases")
+    })?;
 
     println!("Downloading {latest} ...");
+    let signature = signature_for(&download(&manifest_url, 1024 * 1024)?, asset)?;
     let bytes = download(&bin_url, 64 * 1024 * 1024)?;
-    let signature = String::from_utf8(download(&sig_url, 64 * 1024)?)
-        .context("the signature file is not text")?;
     verify(&bytes, &signature)?;
 
     let target = std::env::current_exe().context("finding the running binary")?;
@@ -441,6 +465,27 @@ mod tests {
         // would otherwise surface on the first user to run --update: as an update that can
         // never install, from a release that looked fine.
         verify(SAMPLE, SAMPLE_SIG).expect("PUBLIC_KEY does not match the release signing key");
+    }
+
+    #[test]
+    fn a_signature_travels_through_the_manifest_unchanged() {
+        // The manifest carries the signature as a JSON string, so the newlines minisign
+        // needs survive only if the encoding round-trips. Verified rather than compared, so
+        // the test fails the same way `--update` would.
+        let manifest = serde_json::json!({
+            "version": "9.9.9",
+            "signatures": { "fastpick-test-target": SAMPLE_SIG },
+        })
+        .to_string();
+        let sig = signature_for(manifest.as_bytes(), "fastpick-test-target").unwrap();
+        verify(SAMPLE, &sig).expect("the signature did not survive the manifest");
+    }
+
+    #[test]
+    fn an_asset_missing_from_the_manifest_is_refused() {
+        let manifest = br#"{"version":"9.9.9","signatures":{"something-else":"x"}}"#;
+        let e = signature_for(manifest, "fastpick-test-target").unwrap_err();
+        assert!(e.to_string().contains("no signature"), "{e}");
     }
 
     #[test]

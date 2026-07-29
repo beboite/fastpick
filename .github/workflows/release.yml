@@ -129,7 +129,11 @@ jobs:
 
       # Signed here rather than in each build job: one tool to install, one key to expose,
       # and the key never travels to a Windows or macOS runner.
-      - name: Sign every asset
+      #
+      # The signatures are collected into one manifest instead of being dropped beside each
+      # binary. Eleven files on a release page for five binaries is noise, and a `.minisig`
+      # is not something anyone downloads by hand: `--update` is the only reader.
+      - name: Sign every asset into one manifest
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
@@ -141,11 +145,15 @@ jobs:
           printf '%s\n' "$MINISIGN_SECRET_KEY" | tr -d '\r' > "$key"
           trap 'shred -u "$key" 2>/dev/null || rm -f "$key"' EXIT
           cd dist
+          sigs='{}'
           for f in fastpick-*; do
-            case "$f" in *.minisig) continue ;; esac
             printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key" -m "$f" -x "$f.minisig"
+            sigs=$(printf '%s' "$sigs" | jq --arg n "$f" --rawfile s "$f.minisig" '.[$n] = $s')
+            rm -f "$f.minisig"
           done
-          ls -la
+          jq -n --arg v "${GITHUB_REF_NAME#v}" --argjson s "$sigs" \
+            '{version: $v, signatures: $s}' > SIGNATURES.json
+          cat SIGNATURES.json
 
       - name: Generate SHA256 checksums
         run: |
@@ -161,7 +169,8 @@ jobs:
 
       # Verified with the public key the binaries themselves carry, so a key rotated in the
       # secret without being rotated in the source is caught here instead of by every user's
-      # `--update` at once.
+      # `--update` at once. Read back out of the manifest rather than from the files that
+      # were just signed, so the manifest is what gets checked.
       - name: Verify the signatures against the compiled-in key
         run: |
           pub=$(sed -n 's/^const PUBLIC_KEY: &str = "\(.*\)";$/\1/p' src/update.rs)
@@ -172,8 +181,11 @@ jobs:
           printf 'untrusted comment: fastpick\n%s\n' "$pub" > minisign.pub
           cd dist
           for f in fastpick-*; do
-            case "$f" in *.minisig) continue ;; esac
-            minisign -V -p ../minisign.pub -m "$f"
+            # -j, not -r: the stored string already ends in a newline, and the one -r adds
+            # would leave a blank line at the end of the signature file.
+            jq -ej --arg n "$f" '.signatures[$n]' SIGNATURES.json > "$f.minisig"
+            minisign -V -p ../minisign.pub -m "$f" -x "$f.minisig"
+            rm -f "$f.minisig"
           done
 
       - name: Write the release notes
@@ -196,7 +208,8 @@ jobs:
           ## Install
 
           Download the file for your platform, make it executable and put it on your PATH.
-          Every asset is signed; `SHA256SUMS.txt` covers the same files.
+          Every binary is signed with the project's minisign key; the signatures are in
+          `SIGNATURES.json` and `SHA256SUMS.txt` covers the same files.
 
           An existing install updates itself with `fastpick --update`, which checks the
           signature before replacing anything.

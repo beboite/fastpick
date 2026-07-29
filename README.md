@@ -82,8 +82,9 @@ endpoints reject, which kills resumes and subagents until `small_fast_model` is 
 
 ## Updating
 
-Every release ships one signed binary per platform. `fastpick --update` checks the minisign
-signature against the key compiled into the running binary before replacing anything. The
+Every release ships one signed binary per platform, with the signatures collected in a
+single `SIGNATURES.json`. `fastpick --update` checks the minisign signature against the key
+compiled into the running binary before replacing anything. The
 menu checks for a newer version once a day at most, on a background thread, and only ever
 prints a line naming the version: nothing installs itself.
 
