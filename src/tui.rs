@@ -22,7 +22,6 @@ pub enum Screen {
     Harness,
     Provider,
     Model,
-    Options,
 }
 
 /// What the picker hands back once the user presses Enter on the options screen.
@@ -55,7 +54,9 @@ pub struct App<'a> {
     cfg: &'a Config,
     screen: Screen,
 
-    harness_idx: usize,
+    /// Indices into `cfg.harnesses`, filtered to the ones installed on this machine.
+    harness_rows: Vec<usize>,
+    harness_row: usize,
 
     /// Indices into `cfg.providers`, filtered to those the current harness can reach.
     provider_rows: Vec<usize>,
@@ -82,6 +83,12 @@ pub struct App<'a> {
     efforts: Vec<String>,
     effort_idx: Option<usize>,
 
+    /// The options panel, opened next to the model list rather than after it. Enter on a
+    /// model launches with what was detected, so tuning is a detour and never a step.
+    options_open: bool,
+    /// Which model the current options were computed for, so closing and reopening the
+    /// panel does not throw away what was ticked by hand.
+    options_model: Option<String>,
     opt_row: usize,
     /// Set when the harness cannot do something the model offers, so the options screen
     /// explains the absence rather than silently hiding a row.
@@ -90,13 +97,25 @@ pub struct App<'a> {
 
 impl<'a> App<'a> {
     pub fn new(cfg: &'a Config, start: &Start) -> App<'a> {
+        let mut harness_rows = cfg.harnesses_installed();
+        // A harness named on the command line is kept whatever the detection said: the flag
+        // is an explicit answer, and a binary this missed must not become unreachable.
+        if let Some(i) = start.harness_idx {
+            if i < cfg.harnesses.len() && !harness_rows.contains(&i) {
+                harness_rows.push(i);
+                harness_rows.sort_unstable();
+            }
+        }
+        let harness_row = start
+            .harness_idx
+            .and_then(|i| harness_rows.iter().position(|&r| r == i))
+            .unwrap_or(0);
+
         let mut app = App {
             cfg,
             screen: Screen::Harness,
-            harness_idx: start
-                .harness_idx
-                .unwrap_or(0)
-                .min(cfg.harnesses.len().saturating_sub(1)),
+            harness_rows,
+            harness_row,
             provider_rows: Vec::new(),
             provider_row: 0,
             provider_counts: Vec::new(),
@@ -114,6 +133,8 @@ impl<'a> App<'a> {
             checked: BTreeSet::new(),
             efforts: Vec::new(),
             effort_idx: None,
+            options_open: false,
+            options_model: None,
             opt_row: 0,
             unsupported: Vec::new(),
         };
@@ -126,8 +147,30 @@ impl<'a> App<'a> {
         app
     }
 
+    fn harness_idx(&self) -> usize {
+        self.harness_rows
+            .get(self.harness_row)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Selects a harness by its index in the config whether or not it was detected, the way
+    /// `--harness` does.
+    #[cfg(test)]
+    fn force_harness(&mut self, idx: usize) {
+        if !self.harness_rows.contains(&idx) {
+            self.harness_rows.push(idx);
+            self.harness_rows.sort_unstable();
+        }
+        self.harness_row = self
+            .harness_rows
+            .iter()
+            .position(|&r| r == idx)
+            .unwrap_or(0);
+    }
+
     pub fn harness(&self) -> &crate::config::Harness {
-        &self.cfg.harnesses[self.harness_idx]
+        &self.cfg.harnesses[self.harness_idx()]
     }
 
     fn provider_idx(&self) -> Option<usize> {
@@ -215,15 +258,28 @@ impl<'a> App<'a> {
     pub fn select_model_id(&mut self, id: &str) -> bool {
         match self.models.iter().position(|m| m.id == id) {
             Some(i) => {
-                self.model_idx = self.visible_models.iter().position(|&v| v == i).unwrap_or(0);
+                self.model_idx = self
+                    .visible_models
+                    .iter()
+                    .position(|&v| v == i)
+                    .unwrap_or(0);
                 true
             }
             None => false,
         }
     }
 
+    /// Recomputes the options only when they belong to another model.
+    fn ensure_options(&mut self) {
+        let id = self.model().map(|m| m.id.clone());
+        if id.is_some() && id != self.options_model {
+            self.enter_options();
+        }
+    }
+
     /// Loads the prompt files for the selected model and pre-checks the best match.
     pub fn enter_options(&mut self) {
+        self.options_model = self.model().map(|m| m.id.clone());
         self.opt_row = 0;
         self.checked.clear();
         self.prompt_show_all = false;
@@ -259,7 +315,9 @@ impl<'a> App<'a> {
             return;
         }
 
-        let Some(dir) = self.cfg.prompts_dir() else { return };
+        let Some(dir) = self.cfg.prompts_dir() else {
+            return;
+        };
         let Some(model) = self.model() else { return };
         let base = model.base_name().to_string();
 
@@ -275,7 +333,9 @@ impl<'a> App<'a> {
         if !self.harness().kind.supports_system_prompts() {
             return;
         }
-        let Some(dir) = self.cfg.prompts_dir() else { return };
+        let Some(dir) = self.cfg.prompts_dir() else {
+            return;
+        };
         let Some(model) = self.model() else { return };
         let base = model.base_name().to_string();
 
@@ -319,9 +379,25 @@ impl<'a> App<'a> {
         self.effort_rows() + self.prompt_files.len()
     }
 
+    /// Changes whatever the cursor is on: the effort row steps to the next level, a prompt
+    /// file toggles.
+    fn act_on_row(&mut self) {
+        let base = self.effort_rows();
+        if self.opt_row < base {
+            if let (Some(i), false) = (self.effort_idx, self.efforts.is_empty()) {
+                self.effort_idx = Some(next(i, self.efforts.len()));
+            }
+            return;
+        }
+        let i = self.opt_row - base;
+        if !self.checked.insert(i) {
+            self.checked.remove(&i);
+        }
+    }
+
     pub fn picked(&self) -> Option<Picked> {
         Some(Picked {
-            harness_idx: self.harness_idx,
+            harness_idx: self.harness_idx(),
             provider_idx: self.provider_idx()?,
             model: self.model()?.clone(),
             effort: self.effort_idx.and_then(|i| self.efforts.get(i)).cloned(),
@@ -396,7 +472,6 @@ fn event_loop(
                 pending_model = None;
                 if app.select_model_id(&id) {
                     app.enter_options();
-                    app.set_screen(Screen::Options);
                     return Ok(app.picked());
                 }
                 // Unknown id: fall back to the list rather than launching something else.
@@ -413,7 +488,9 @@ fn event_loop(
             continue;
         }
 
-        let Event::Key(key) = event::read()? else { continue };
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
@@ -425,12 +502,12 @@ fn event_loop(
             Screen::Harness => match key.code {
                 KeyCode::Char('q') => return Ok(None),
                 KeyCode::Up | KeyCode::Char('k') => {
-                    app.harness_idx = prev(app.harness_idx, app.cfg.harnesses.len());
+                    app.harness_row = prev(app.harness_row, app.harness_rows.len());
                     app.provider_row = 0;
                     app.rebuild_providers();
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    app.harness_idx = next(app.harness_idx, app.cfg.harnesses.len());
+                    app.harness_row = next(app.harness_row, app.harness_rows.len());
                     app.provider_row = 0;
                     app.rebuild_providers();
                 }
@@ -461,6 +538,31 @@ fn event_loop(
                 _ => {}
             },
 
+            // The options panel takes the keys while it is open: the model list keeps its
+            // selection but not the cursor, so nothing moves behind the panel.
+            Screen::Model if app.options_open => match key.code {
+                KeyCode::Esc | KeyCode::Left => app.options_open = false,
+                KeyCode::Char('q') => return Ok(None),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let n = app.rows();
+                    if n > 0 {
+                        app.opt_row = prev(app.opt_row, n);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let n = app.rows();
+                    if n > 0 {
+                        app.opt_row = next(app.opt_row, n);
+                    }
+                }
+                // One key acts on the current row whatever it holds, which leaves
+                // left and right to mean back and forward on every screen.
+                KeyCode::Char(' ') | KeyCode::Right => app.act_on_row(),
+                KeyCode::Char('a') => app.toggle_show_all(),
+                KeyCode::Enter => return Ok(app.picked()),
+                _ => {}
+            },
+
             Screen::Model => match key.code {
                 KeyCode::Esc | KeyCode::Left => {
                     if app.filter.is_empty() {
@@ -477,10 +579,19 @@ fn event_loop(
                     app.rebuild_models();
                 }
                 KeyCode::Tab => app.load_models(true),
+                KeyCode::Right => {
+                    if app.model().is_some() {
+                        app.ensure_options();
+                        app.options_open = true;
+                    }
+                }
+                // Enter launches from here. What the panel would have shown is already
+                // decided: the matching prompt file is checked and the effort is the
+                // model's default, so the common case is one key.
                 KeyCode::Enter => {
                     if app.model().is_some() {
-                        app.enter_options();
-                        app.set_screen(Screen::Options);
+                        app.ensure_options();
+                        return Ok(app.picked());
                     }
                 }
                 KeyCode::Char(c) => {
@@ -488,46 +599,6 @@ fn event_loop(
                     app.model_idx = 0;
                     app.rebuild_models();
                 }
-                _ => {}
-            },
-
-            Screen::Options => match key.code {
-                KeyCode::Esc => app.set_screen(Screen::Model),
-                KeyCode::Char('q') => return Ok(None),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    let n = app.rows();
-                    if n > 0 {
-                        app.opt_row = prev(app.opt_row, n);
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let n = app.rows();
-                    if n > 0 {
-                        app.opt_row = next(app.opt_row, n);
-                    }
-                }
-                KeyCode::Left | KeyCode::Right => {
-                    if app.opt_row < app.effort_rows() {
-                        if let (Some(i), false) = (app.effort_idx, app.efforts.is_empty()) {
-                            app.effort_idx = Some(if key.code == KeyCode::Left {
-                                prev(i, app.efforts.len())
-                            } else {
-                                next(i, app.efforts.len())
-                            });
-                        }
-                    }
-                }
-                KeyCode::Char(' ') => {
-                    let base = app.effort_rows();
-                    if app.opt_row >= base {
-                        let i = app.opt_row - base;
-                        if !app.checked.insert(i) {
-                            app.checked.remove(&i);
-                        }
-                    }
-                }
-                KeyCode::Char('a') => app.toggle_show_all(),
-                KeyCode::Enter => return Ok(app.picked()),
                 _ => {}
             },
         }
@@ -569,38 +640,52 @@ enum Body {
 fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     let body = body(app);
+    let panel = app.options_open.then(|| options_body(app));
+
+    // The panel opens beside the list, not over it and not after it: the model being
+    // configured stays on screen, and closing it puts the cursor back where it was.
+    let (left_width, right_width) = match panel {
+        None => (area.width, 0),
+        Some(_) => {
+            // The panel keeps enough room for an effort row and a file name whatever the
+            // model list is called.
+            let split = (width_of(&body) + 5)
+                .clamp(16, area.width.saturating_sub(34).max(16))
+                .min(area.width);
+            (split, area.width - split)
+        }
+    };
 
     // The body is sized to what it holds rather than to the terminal. Six providers take
     // six lines, not a bordered box the height of the window with six lines inside it.
-    let wanted = match &body {
-        Body::Rows(rows, _) => rows.len() as u16,
-        Body::Text(t) => wrapped_height(t, area.width),
-    };
+    let wanted = height_of(&body, left_width).max(match &panel {
+        Some(p) => height_of(p, right_width),
+        None => 0,
+    });
     // title, blank, body, blank, status, help.
     let room = area.height.saturating_sub(5).max(1);
     let height = wanted.clamp(1, room);
 
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            title(app),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))),
-        Rect { height: 1, ..area },
-    );
+    f.render_widget(Paragraph::new(title(app)), Rect { height: 1, ..area });
 
     let body_area = Rect {
         y: area.y + 2,
         height,
+        width: left_width,
         ..area
     };
-    match body {
-        Body::Rows(rows, selected) => render_rows(f, body_area, rows, selected),
-        Body::Text(text) => f.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: true })
-                .style(Style::new().fg(Color::Gray)),
-            body_area,
-        ),
+    render_body(f, body_area, body, !app.options_open);
+    if let Some(p) = panel {
+        render_body(
+            f,
+            Rect {
+                x: area.x + left_width,
+                width: right_width,
+                ..body_area
+            },
+            p,
+            true,
+        );
     }
 
     let footer = Rect {
@@ -618,10 +703,47 @@ fn draw(f: &mut Frame, app: &App) {
                         _ => Color::DarkGray,
                     }),
                 )),
-                Line::from(Span::styled(help(app), Style::new().fg(Color::DarkGray))),
+                footer_line(app),
             ]),
             footer,
         );
+    }
+}
+
+fn height_of(body: &Body, width: u16) -> u16 {
+    match body {
+        Body::Rows(rows, _) => rows.len() as u16,
+        Body::Text(t) => wrapped_height(t, width),
+    }
+}
+
+/// The widest line, cursor marker aside. Only used to decide where the panel starts, so a
+/// long model name pushes the split right instead of being cut in half.
+fn width_of(body: &Body) -> u16 {
+    let width = match body {
+        Body::Rows(rows, _) => rows
+            .iter()
+            .map(|r| match r {
+                Row::Gap => 0,
+                Row::Heading(t) => t.chars().count(),
+                Row::Item(l) => l.width(),
+            })
+            .max()
+            .unwrap_or(0),
+        Body::Text(t) => t.lines().map(|l| l.chars().count()).max().unwrap_or(0),
+    };
+    width.try_into().unwrap_or(u16::MAX)
+}
+
+fn render_body(f: &mut Frame, area: Rect, body: Body, focused: bool) {
+    match body {
+        Body::Rows(rows, selected) => render_rows(f, area, rows, selected, focused),
+        Body::Text(text) => f.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: true })
+                .style(Style::new().fg(Color::Gray)),
+            area,
+        ),
     }
 }
 
@@ -634,7 +756,7 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         .max(1)
 }
 
-fn render_rows(f: &mut Frame, area: Rect, rows: Vec<Row>, selected: usize) {
+fn render_rows(f: &mut Frame, area: Rect, rows: Vec<Row>, selected: usize, focused: bool) {
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
     let mut cursor = 0;
     let mut seen = 0;
@@ -657,47 +779,96 @@ fn render_rows(f: &mut Frame, area: Rect, rows: Vec<Row>, selected: usize) {
 
     let mut state = ListState::default().with_selected(Some(cursor));
     f.render_stateful_widget(
-        List::new(items)
-            .highlight_symbol("> ")
-            .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        List::new(items).highlight_symbol("> ").highlight_style(
+            // The marker stays on the unfocused list so the model being configured is
+            // still named, but the colour follows the keys.
+            match focused {
+                true => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                false => Style::new(),
+            },
+        ),
         area,
         &mut state,
     );
 }
 
-fn title(app: &App) -> String {
-    match app.screen {
-        Screen::Harness => "fastpick  ·  harness".to_string(),
-        Screen::Provider => format!("fastpick  ·  {}  ·  provider", app.harness().name),
-        Screen::Model => format!(
-            "fastpick  ·  {}  ·  {}  ·  {}",
-            app.harness().name,
-            app.provider().map(|p| p.name.as_str()).unwrap_or("?"),
-            match app.filter.is_empty() {
-                true => "model".to_string(),
-                false => format!("/{}", app.filter),
-            }
-        ),
-        Screen::Options => format!(
-            "fastpick  ·  {}  ·  {}  ·  {}{}",
-            app.harness().name,
-            app.provider().map(|p| p.name.as_str()).unwrap_or("?"),
-            app.model().map(|m| m.display()).unwrap_or("?"),
-            match app.prompt_show_all {
-                true => "  ·  every file",
-                false => "",
-            }
-        ),
+const STEPS: [&str; 3] = ["harness", "provider", "model"];
+
+/// The whole trail on one line: what is already answered, what is being asked, what is
+/// still to come. A first-time user should see three questions coming without being told,
+/// so the steps ahead are drawn as their own names rather than left out until reached.
+fn title(app: &App) -> Line<'static> {
+    let step = match (app.screen, app.options_open) {
+        (Screen::Harness, _) => 0,
+        (Screen::Provider, _) => 1,
+        (Screen::Model, false) => 2,
+        // The panel is a detour off the last step, not a fourth one, so the trail keeps
+        // its three questions and the model stays the one being answered.
+        (Screen::Model, true) => 3,
+    };
+    let answers = [
+        Some(app.harness().name.clone()),
+        app.provider().map(|p| p.name.clone()),
+        app.model().map(|m| m.display().to_string()),
+    ];
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(STEPS.len() * 2);
+    for (i, name) in STEPS.iter().enumerate() {
+        if i > 0 {
+            spans.push(dim("  ·  ".to_string()));
+        }
+        match i.cmp(&step) {
+            // Answered, so the answer takes the place of the question.
+            std::cmp::Ordering::Less => spans.push(Span::styled(
+                answers[i].clone().unwrap_or_else(|| "?".to_string()),
+                Style::new().fg(Color::Gray),
+            )),
+            std::cmp::Ordering::Equal => spans.push(Span::styled(
+                format!("{name} ?"),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+            std::cmp::Ordering::Greater => spans.push(dim(name.to_string())),
+        }
     }
+
+    if app.options_open {
+        spans.push(dim("  ·  ".to_string()));
+        spans.push(Span::styled(
+            "options",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+        if app.prompt_show_all {
+            spans.push(dim("   every file".to_string()));
+        }
+    } else if app.screen == Screen::Model && !app.filter.is_empty() {
+        spans.push(dim(format!("   /{}", app.filter)));
+    }
+    Line::from(spans)
+}
+
+/// The name sits with the keys rather than in the title: the title answers "what is being
+/// asked", and which program is asking is a detail that belongs out of the way.
+fn footer_line(app: &App) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "fastpick",
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        dim(format!("   {}", help(app))),
+    ])
 }
 
 fn help(app: &App) -> &'static str {
-    match app.screen {
-        Screen::Harness => "up/down move   enter select   q quit",
-        Screen::Provider => "up/down move   enter select   esc back   q quit",
-        Screen::Model => "up/down move   type to filter   tab refetch   enter select   esc back",
-        Screen::Options => {
-            "up/down move   space toggle   left/right effort   a every file   enter launch   esc back"
+    match (app.screen, app.options_open) {
+        (Screen::Harness, _) => "up/down move   right next   q quit",
+        (Screen::Provider, _) => "up/down move   right next   left back   q quit",
+        (Screen::Model, false) => {
+            "up/down move   enter launch   right options   left back   type to filter   tab refetch"
+        }
+        (Screen::Model, true) => {
+            "up/down move   space change   a every file   enter launch   left back"
         }
     }
 }
@@ -722,7 +893,6 @@ fn body(app: &App) -> Body {
         Screen::Harness => harness_body(app),
         Screen::Provider => provider_body(app),
         Screen::Model => model_body(app),
-        Screen::Options => options_body(app),
     }
 }
 
@@ -740,23 +910,34 @@ fn count(n: usize, thing: &str) -> String {
 }
 
 fn harness_body(app: &App) -> Body {
+    // Only what is installed is offered. A menu whose entries mostly fail is worse than a
+    // short one, so a declared harness with no binary is left out rather than greyed.
+    if app.harness_rows.is_empty() {
+        let missing: Vec<String> = app
+            .cfg
+            .harnesses
+            .iter()
+            .map(|h| format!("{} ({})", h.name, h.bin))
+            .collect();
+        return Body::Text(format!(
+            "None of the harnesses in the config is installed:\n{}\n\nInstall one, or point its `bin` at where it lives. `--harness <id>` runs one anyway.",
+            missing.join("\n")
+        ));
+    }
+
     let rows = app
-        .cfg
-        .harnesses
+        .harness_rows
         .iter()
+        .filter_map(|&i| app.cfg.harnesses.get(i))
         .map(|h| {
             let n = app.cfg.providers_for(&h.id).len();
-            let mut spans = vec![
+            Row::Item(Line::from(vec![
                 Span::raw(h.name.clone()),
                 Span::styled(count(n, "provider"), Style::new().fg(Color::Blue)),
-            ];
-            if let Some(note) = &h.note {
-                spans.push(dim(format!("   {note}")));
-            }
-            Row::Item(Line::from(spans))
+            ]))
         })
         .collect();
-    Body::Rows(rows, app.harness_idx)
+    Body::Rows(rows, app.harness_row)
 }
 
 fn provider_body(app: &App) -> Body {
@@ -771,7 +952,9 @@ fn provider_body(app: &App) -> Body {
     let mut rows = Vec::new();
     let mut current: Option<&str> = None;
     for (row, &i) in app.provider_rows.iter().enumerate() {
-        let Some(p) = app.cfg.providers.get(i) else { continue };
+        let Some(p) = app.cfg.providers.get(i) else {
+            continue;
+        };
 
         // A heading opens each block, and the blocks are separated by a blank line. Two
         // entries that are the same site with a different key belong under one heading, so
@@ -789,10 +972,10 @@ fn provider_body(app: &App) -> Body {
 
         let mut spans = vec![Span::raw(p.name.clone())];
         if let Some(n) = app.provider_counts.get(row).copied().flatten() {
-            spans.push(Span::styled(count(n, "model"), Style::new().fg(Color::Blue)));
-        }
-        if let Some(note) = &p.note {
-            spans.push(dim(format!("   {note}")));
+            spans.push(Span::styled(
+                count(n, "model"),
+                Style::new().fg(Color::Blue),
+            ));
         }
         rows.push(Row::Item(Line::from(spans)));
     }
@@ -828,9 +1011,6 @@ fn model_body(app: &App) -> Body {
                     Style::new().fg(Color::Blue),
                 ));
             }
-            if let Some(note) = &m.note {
-                spans.push(dim(format!("   {note}")));
-            }
             Row::Item(Line::from(spans))
         })
         .collect();
@@ -840,14 +1020,20 @@ fn model_body(app: &App) -> Body {
 fn options_body(app: &App) -> Body {
     let mut rows: Vec<Row> = Vec::new();
 
-    if let Some(i) = app.effort_idx {
-        let current = app.efforts.get(i).cloned().unwrap_or_default();
-        rows.push(Row::Item(Line::from(vec![
-            dim("effort   ".to_string()),
-            Span::raw("< "),
-            Span::styled(current, Style::new().fg(Color::Yellow)),
-            Span::raw(" >"),
-        ])));
+    if let Some(sel) = app.effort_idx {
+        // Every level is drawn, the current one lit: what the key does is then visible
+        // without a legend, which a `< high >` spinner cannot show.
+        let mut spans = vec![dim("effort  ".to_string())];
+        for (i, e) in app.efforts.iter().enumerate() {
+            spans.push(Span::styled(
+                format!(" {e}"),
+                match i == sel {
+                    true => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    false => Style::new().fg(Color::DarkGray),
+                },
+            ));
+        }
+        rows.push(Row::Item(Line::from(spans)));
     }
 
     if !app.prompt_files.is_empty() {
@@ -857,7 +1043,11 @@ fn options_body(app: &App) -> Body {
         rows.push(Row::Heading("system prompt".to_string()));
     }
     for (i, file) in app.prompt_files.iter().enumerate() {
-        let mark = if app.checked.contains(&i) { "[x] " } else { "[ ] " };
+        let mark = if app.checked.contains(&i) {
+            "[x] "
+        } else {
+            "[ ] "
+        };
         let matched = i < app.prompt_matches;
         let mut spans = vec![
             Span::styled(mark, Style::new().fg(Color::Green)),
@@ -950,6 +1140,27 @@ mod tests {
             }
             println!();
         }
+
+        // A hand-made model rather than a fetched one: the preview must not hit the network.
+        app.set_screen(Screen::Model);
+        let mut m = Model::new("claude-opus-5[1m]".into());
+        m.label = Some("Opus 5".into());
+        m.context_window = Some(1_000_000);
+        m.effort = vec!["low".into(), "medium".into(), "high".into(), "max".into()];
+        m.effort_default = Some("high".into());
+        app.models = vec![m, Model::new("claude-sonnet-5".into())];
+        app.rebuild_models();
+        for open in [false, true] {
+            app.options_open = open;
+            if open {
+                app.enter_options();
+                app.options_open = true;
+            }
+            for l in render_lines(&app) {
+                println!("|{l}|");
+            }
+            println!();
+        }
     }
 
     #[test]
@@ -970,8 +1181,11 @@ mod tests {
         assert!(render(&app).contains("some-model"));
 
         app.enter_options();
-        app.set_screen(Screen::Options);
-        assert!(render(&app).contains("Enter launches") || render(&app).contains(".md"));
+        app.options_open = true;
+        let drawn = render(&app);
+        assert!(drawn.contains("Enter launches") || drawn.contains(".md"));
+        // The panel sits beside the list, so the model is still on screen behind it.
+        assert!(drawn.contains("some-model"));
     }
 
     /// A heading is drawn, and the cursor still lands on the provider it names rather than
@@ -1037,12 +1251,44 @@ mod tests {
         }
     }
 
+    /// The menu offers what can actually run, so a config listing agents this machine does
+    /// not have is not a menu of failures.
+    #[test]
+    fn a_harness_with_no_binary_is_not_offered() {
+        let cfg = cfg();
+        let app = App::new(&cfg, &Start::default());
+        for &i in &app.harness_rows {
+            assert!(
+                crate::paths::locate(&cfg.harnesses[i].bin).is_some(),
+                "`{}` is offered but is not installed",
+                cfg.harnesses[i].bin
+            );
+        }
+    }
+
+    /// Named on the command line beats detected: a wrong answer from PATH must not make a
+    /// harness unreachable.
+    #[test]
+    fn a_named_harness_is_offered_even_when_it_was_not_detected() {
+        let cfg = cfg();
+        let last = cfg.harnesses.len() - 1;
+        let app = App::new(
+            &cfg,
+            &Start {
+                harness_idx: Some(last),
+                ..Start::default()
+            },
+        );
+        assert!(app.harness_rows.contains(&last));
+        assert_eq!(app.harness_idx(), last);
+    }
+
     #[test]
     fn switching_harness_reshuffles_the_provider_list_without_leaving_a_stale_index() {
         let cfg = cfg();
         let mut app = App::new(&cfg, &Start::default());
         for i in 0..cfg.harnesses.len() {
-            app.harness_idx = i;
+            app.force_harness(i);
             app.rebuild_providers();
             assert!(app.provider_rows.iter().all(|&p| p < cfg.providers.len()));
             assert!(app.provider_row < app.provider_rows.len().max(1));
@@ -1086,7 +1332,7 @@ mod tests {
         };
 
         let mut app = App::new(&cfg, &Start::default());
-        app.harness_idx = codex;
+        app.force_harness(codex);
         app.rebuild_providers();
         let mut m = Model::new("m".into());
         m.effort = vec!["high".into()];
@@ -1098,6 +1344,52 @@ mod tests {
         assert_eq!(app.effort_rows(), 0);
         assert!(app.picked().unwrap().effort.is_none());
         assert!(!app.unsupported.is_empty());
+    }
+
+    /// Closing the panel is not cancelling: what was ticked by hand survives, and only
+    /// moving to another model starts the detection over.
+    #[test]
+    fn reopening_the_panel_keeps_what_was_ticked() {
+        let cfg = cfg();
+        let mut app = App::new(&cfg, &Start::default());
+        app.set_screen(Screen::Model);
+        app.models = vec![Model::new("a".into()), Model::new("b".into())];
+        app.rebuild_models();
+        app.ensure_options();
+
+        app.prompt_files = vec![PromptFile {
+            path: "some.md".into(),
+            stem: "some".into(),
+            score: 0,
+        }];
+        app.checked.clear();
+        app.act_on_row();
+        assert!(app.checked.contains(&0));
+
+        app.options_open = false;
+        app.ensure_options();
+        assert!(
+            app.checked.contains(&0),
+            "the same model must not have its options recomputed"
+        );
+
+        app.model_idx = 1;
+        app.ensure_options();
+        assert!(app.checked.is_empty(), "another model starts over");
+    }
+
+    /// Enter on a model launches. The options are still resolved, so the file that matches
+    /// is appended without the panel ever being opened.
+    #[test]
+    fn a_model_can_be_launched_without_opening_the_panel() {
+        let cfg = cfg();
+        let mut app = App::new(&cfg, &Start::default());
+        app.set_screen(Screen::Model);
+        app.models = vec![Model::new("a".into())];
+        app.rebuild_models();
+        app.ensure_options();
+        assert!(!app.options_open);
+        assert!(app.picked().is_some());
     }
 
     #[test]

@@ -24,11 +24,19 @@ pub fn all_in(dir: &Path) -> Vec<PromptFile> {
     };
     let mut out: Vec<PromptFile> = entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("md")))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("md"))
+        })
         .filter_map(|e| {
             let path = e.path();
             let stem = path.file_stem()?.to_string_lossy().to_string();
-            Some(PromptFile { path, stem, score: 0 })
+            Some(PromptFile {
+                path,
+                stem,
+                score: 0,
+            })
         })
         .collect();
     out.sort_by(|a, b| a.stem.to_lowercase().cmp(&b.stem.to_lowercase()));

@@ -74,8 +74,6 @@ pub struct Harness {
     pub bin: String,
     #[serde(default)]
     pub extra_args: Vec<String>,
-    #[serde(default)]
-    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,9 +116,6 @@ pub struct Provider {
     /// One entry per harness this provider can serve, keyed by harness id.
     #[serde(default)]
     pub harness: BTreeMap<String, Binding>,
-
-    #[serde(default)]
-    pub note: Option<String>,
 
     /// Layered on top of the fetched catalogue: labels, context windows and effort levels
     /// no API reports. Also the fallback list when there is no catalogue at all.
@@ -206,9 +201,6 @@ pub struct Model {
 
     #[serde(default)]
     pub small_fast_model: Option<String>,
-
-    #[serde(default)]
-    pub note: Option<String>,
 }
 
 impl Model {
@@ -221,7 +213,6 @@ impl Model {
             effort: Vec::new(),
             effort_default: None,
             small_fast_model: None,
-            note: None,
         }
     }
 
@@ -324,6 +315,21 @@ impl Config {
         Ok(())
     }
 
+    /// The harnesses whose binary is on this machine, in config order.
+    ///
+    /// The config is a description of what could be launched anywhere, and the same file is
+    /// meant to follow its owner from one machine to the next. Which agents are actually
+    /// installed is a property of the machine, so it is answered by looking rather than by
+    /// asking the user to keep a list in sync.
+    pub fn harnesses_installed(&self) -> Vec<usize> {
+        self.harnesses
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| crate::paths::locate(&h.bin).is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// The providers that can serve a given harness, in config order.
     pub fn providers_for(&self, harness_id: &str) -> Vec<usize> {
         self.providers
@@ -342,9 +348,21 @@ impl Config {
     }
 }
 
-/// `%APPDATA%\fastpick` on Windows, `~/.config/fastpick` elsewhere.
+/// `%APPDATA%\fastpick` on Windows, `$XDG_CONFIG_HOME/fastpick` or `~/.config/fastpick` on
+/// macOS and Linux alike.
+///
+/// Deliberately not `dirs::config_dir()` on macOS: that answers `~/Library/Application
+/// Support`, which is right for an app with a window and wrong for a command-line tool
+/// whose config is meant to be opened in an editor and kept in a dotfiles repo next to the
+/// agents it launches.
 pub fn config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("fastpick"))
+    if cfg!(windows) {
+        return dirs::config_dir().map(|d| d.join("fastpick"));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("fastpick"));
+    }
+    dirs::home_dir().map(|h| h.join(".config").join("fastpick"))
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -359,6 +377,9 @@ pub fn ensure_config(path: &Path) -> Result<bool> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
+        // The folder is where key files end up by default, so it is closed to other users
+        // from the start rather than after the first one is written.
+        crate::secrets::harden_dir(parent);
         let prompts = parent.join("system-prompts");
         std::fs::create_dir_all(&prompts)
             .with_context(|| format!("creating {}", prompts.display()))?;

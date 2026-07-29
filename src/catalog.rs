@@ -103,7 +103,13 @@ fn cache_path(provider_id: &str) -> Option<PathBuf> {
     // The id is used as a file name, so keep it to something a file system accepts.
     let safe: String = provider_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     crate::config::config_dir().map(|d| d.join("catalog").join(format!("{safe}.json")))
 }
@@ -159,8 +165,7 @@ fn fetch(r: &Request) -> Result<Vec<Entry>> {
         let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
-        if !cat.only_prefixes.is_empty()
-            && !cat.only_prefixes.iter().any(|pre| id.starts_with(pre))
+        if !cat.only_prefixes.is_empty() && !cat.only_prefixes.iter().any(|pre| id.starts_with(pre))
         {
             continue;
         }
@@ -211,7 +216,9 @@ pub fn cached_count(config_models: &[Model], provider_id: &str) -> Option<usize>
 }
 
 fn write_cache(provider_id: &str, models: &[Entry]) {
-    let Some(path) = cache_path(provider_id) else { return };
+    let Some(path) = cache_path(provider_id) else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -230,7 +237,10 @@ fn write_cache(provider_id: &str, models: &[Entry]) {
 /// degrades one step rather than erroring: live, then cache, then the config list.
 pub fn run(r: &Request) -> (Vec<Model>, Source) {
     if r.catalog.is_none() {
-        return (r.config_models.clone(), Source::Config(r.config_models.len()));
+        return (
+            r.config_models.clone(),
+            Source::Config(r.config_models.len()),
+        );
     }
 
     let cached = read_cache(&r.provider_id);
@@ -257,10 +267,7 @@ pub fn run(r: &Request) -> (Vec<Model>, Source) {
                 let n = merged.len();
                 (merged, Source::Cache(n, now().saturating_sub(c.fetched_at)))
             }
-            None => (
-                r.config_models.clone(),
-                Source::Failed(e.to_string()),
-            ),
+            None => (r.config_models.clone(), Source::Failed(e.to_string())),
         },
     }
 }

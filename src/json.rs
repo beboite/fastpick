@@ -22,7 +22,9 @@ use crate::paths::expand;
 use crate::prompts;
 
 /// Bumped only when a consumer would have to change. A new field is not a bump.
-pub const SCHEMA: u32 = 1;
+/// 2: `note` dropped from harnesses, providers and models. It never carried anything a
+/// caller could act on, only prose about one machine's setup.
+pub const SCHEMA: u32 = 2;
 
 /// Environment variables whose value is a credential. Matched by exact name, never by
 /// substring: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` also contains `TOKEN`, and hiding a context
@@ -65,7 +67,9 @@ struct HarnessView {
     bin: String,
     supports_system_prompts: bool,
     supports_effort: bool,
-    note: Option<String>,
+    /// Whether `bin` was found on this machine. A caller offering its own menu should hide
+    /// what is not installed, the way the picker does.
+    installed: bool,
     /// Ids of the providers wired to this harness, in config order. A pair absent here
     /// cannot be launched.
     providers: Vec<String>,
@@ -77,7 +81,6 @@ struct ProviderView {
     id: String,
     name: String,
     group: Option<String>,
-    note: Option<String>,
     /// Whether this provider authenticates with a key file at all. `false` means the
     /// harness keeps its own login.
     needs_key: bool,
@@ -147,7 +150,6 @@ struct ModelView {
     context_window: Option<u64>,
     effort: Vec<String>,
     effort_default: Option<String>,
-    note: Option<String>,
     /// System prompt files matching this model, most specific first, as `--md` names.
     prompts: Vec<String>,
 }
@@ -174,7 +176,6 @@ fn provider_view(p: &Provider) -> ProviderView {
         id: p.id.clone(),
         name: p.name.clone(),
         group: p.group.clone(),
-        note: p.note.clone(),
         needs_key: p.auth_token_file.is_some(),
         key_present: p
             .auth_token_file
@@ -234,7 +235,6 @@ pub fn listing(
                         context_window: m.context_window,
                         effort: m.effort.clone(),
                         effort_default: m.effort_default.clone(),
-                        note: m.note.clone(),
                         prompts: dir
                             .as_ref()
                             .map(|d| {
@@ -265,7 +265,7 @@ pub fn listing(
                 bin: h.bin.clone(),
                 supports_system_prompts: h.kind.supports_system_prompts(),
                 supports_effort: h.kind.supports_effort(),
-                note: h.note.clone(),
+                installed: crate::paths::locate(&h.bin).is_some(),
                 providers: cfg
                     .providers_for(&h.id)
                     .into_iter()
@@ -339,7 +339,9 @@ pub fn dry_run(cfg: &Config, sel: &Selection) -> Result<DryRun> {
     let mut secret_env = BTreeMap::new();
     for (k, v) in cmd.get_envs() {
         let key = k.to_string_lossy().to_string();
-        let val = v.map(|v| v.to_string_lossy().to_string()).unwrap_or_default();
+        let val = v
+            .map(|v| v.to_string_lossy().to_string())
+            .unwrap_or_default();
         if is_secret(&key) {
             secret_env.insert(key, Secret { chars: val.len() });
         } else {
@@ -460,7 +462,10 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        assert_eq!(by_id("claude-code")["providers"], serde_json::json!(["acme", "builtin"]));
+        assert_eq!(
+            by_id("claude-code")["providers"],
+            serde_json::json!(["acme", "builtin"])
+        );
         // Nothing binds Codex, so offering it a provider would offer a launch that fails.
         assert_eq!(by_id("codex")["providers"], serde_json::json!([]));
     }
@@ -552,7 +557,11 @@ mod tests {
     fn a_dry_run_names_the_credentials_and_prints_none_of_them() {
         let (_d, cfg) = fixture();
         let model = Model::new("orca-v4-pro".into());
-        let harness = cfg.harnesses.iter().find(|h| h.id == "claude-code").unwrap();
+        let harness = cfg
+            .harnesses
+            .iter()
+            .find(|h| h.id == "claude-code")
+            .unwrap();
         let provider = cfg.providers.iter().find(|p| p.id == "acme").unwrap();
         let sel = Selection {
             harness,

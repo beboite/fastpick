@@ -21,9 +21,53 @@ fastpick --list --json                          # the same, for another program
 Each of `--harness`, `--provider` and `--model` skips its own screen. The menu opens on the
 first one you left out.
 
-Keys: arrows move, Enter selects, Esc goes back, Space checks a system prompt file,
-left/right changes the effort level, `tab` refetches the model list, `a` lists every file
-in the prompts folder, and typing filters the model list.
+Up and down move, right goes forward, left goes back. On the model list Enter launches
+straight away: the system prompt file matching the model is already checked and the effort
+is the model's default, so the usual case is one key.
+
+Right on a model opens the options panel beside the list rather than after it. There, space
+changes whatever the cursor is on, the effort level or a system prompt file, `a` lists every
+file in the prompts folder, left closes it and Enter launches. `tab` refetches the model
+list and typing filters it.
+
+## Setting it up
+
+Drop the binary anywhere on your PATH, then run `fastpick` once. It writes a starter config
+and stops, because the providers it ships are examples rather than endpoints:
+
+```
+fastpick                    # writes the config, tells you where, exits
+fastpick --edit             # opens it in $VISUAL, $EDITOR, or your platform's default
+```
+
+The file has one commented block per kind of harness and per kind of provider. Editing it
+is the whole configuration; nothing else has a setup step.
+
+1. **Keep the harnesses you use.** They are declared, not detected, but only the ones whose
+   `bin` is actually installed are offered, so leaving a block in for the machine where you
+   do have that agent costs nothing.
+2. **Replace the example providers with your endpoints.** One `[[provider]]` per endpoint,
+   with a `[provider.harness.<id>]` block for each agent that can reach it. A provider with
+   no block for an agent simply does not appear when that agent is picked.
+3. **Give each one a key file** with `auth_token_file`, then write the key without it ever
+   reaching your shell history:
+
+```
+fastpick --set-key acme     # prompts, does not echo, writes owner-only
+pass show acme | fastpick --set-key acme      # or pipe it in
+fastpick --paths            # where everything lives, and who can read each key file
+```
+
+4. **Point `system_prompts_dir` wherever you keep your `.md` files**, or drop them in the
+   folder fastpick already made next to the config.
+
+Everything is a path you choose: the config with `--config`, the prompts folder with
+`system_prompts_dir`, each key with `auth_token_file`, and each agent with its `bin`, which
+takes a full path when the binary is not on PATH. Paths accept `~`, `$VAR` and `%VAR%`, so
+one config can follow you across machines.
+
+Nothing is written to your agents' own config files, and no credential is ever written into
+a config file, a command line or a log.
 
 ## Harnesses
 
@@ -33,13 +77,18 @@ in the prompts folder, and typing filters the model list.
 | OpenCode | one inline JSON config in `OPENCODE_CONFIG_CONTENT` | `--model provider/model` | its `instructions` array, appends |
 | Codex | dotted TOML overrides with `-c` | `--model` | **not supported**, see below |
 
+Only the harnesses whose binary is on this machine are offered: the config describes what
+could be launched anywhere, and one file is meant to follow you across machines that do not
+have the same agents installed. `--list` shows them all, marking what is missing, and
+`--harness <id>` runs one regardless, in case the lookup is wrong.
+
 Nothing writes to your agents' own config files. OpenCode's inline config is *merged* over
 `opencode.json` rather than replacing it, so MCP servers, plugins and agents survive
 untouched, and Codex's `-c` overrides never touch `~/.codex/config.toml`.
 
 **Codex gets no system prompt row on purpose.** It has no append-only surface for extra
 instructions: its instructions override replaces the base prompt, tool rules included.
-Rather than quietly swapping the agent's own prompt for yours, the options screen says the
+Rather than quietly swapping the agent's own prompt for yours, the options panel says the
 harness cannot do it. Effort levels are likewise offered only where the harness passes one
 through, which today is Claude Code.
 
@@ -151,12 +200,24 @@ Written to your config directory on first run, with one commented block per kind
 and per kind of provider:
 
 - `%APPDATA%\fastpick\config.toml` on Windows
-- `~/.config/fastpick/config.toml` elsewhere
+- `$XDG_CONFIG_HOME/fastpick/config.toml`, or `~/.config/fastpick/config.toml`, on macOS and
+  Linux alike. Not `~/Library/Application Support` on macOS: this is a file you edit and
+  keep in a dotfiles repo, not application state.
+
+Beside it sit `system-prompts/`, `catalog/` (one cached model list per provider) and
+`state.toml`, which remembers where the menu was left. `--paths` prints all of them.
 
 Keys are referenced by file path and never inlined, and they never reach a config file or a
 command line: OpenCode gets `{env:FASTPICK_PROVIDER_KEY}` and Codex gets an `env_key`
 pointing at the same variable. `--dry-run` prints the resolved environment with the
 credentials replaced by their length.
+
+`--set-key <provider>` writes one, reading it from stdin so it is never an argument: a key
+typed as an argument lands in your shell history and in the process list of every user on
+the machine. The file is created owner-only, and on Unix a key that anyone else can read is
+reported by `--paths` and again on the launch that uses it. On Windows there are no mode
+bits to check, so it inherits the permissions of your user profile, which is what the agents
+themselves rely on for their own credentials.
 
 ## Driving it from another program
 

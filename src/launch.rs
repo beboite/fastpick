@@ -49,7 +49,19 @@ fn token_of(p: &Provider) -> Result<Option<String>> {
     };
     let path = expand(keyfile);
     if !path.exists() {
-        return Err(anyhow!("{}: missing key file {}", p.name, path.display()));
+        return Err(anyhow!(
+            "{}: missing key file {}. `fastpick --set-key {}` writes it",
+            p.name,
+            path.display(),
+            p.id
+        ));
+    }
+    // Said once, at the moment the file is actually read, and never fatal: refusing to
+    // launch over a permission bit would be fastpick deciding something that is the
+    // owner's call.
+    let access = crate::secrets::access(&path);
+    if access.is_problem() {
+        eprintln!("fastpick: {} is {}", path.display(), access.label());
     }
     Ok(Some(read_token(&path)?))
 }
@@ -73,7 +85,10 @@ fn ensure_proxy(p: &Provider) -> Result<()> {
         ));
     }
 
-    println!("Starting the proxy for {} on 127.0.0.1:{} ...", p.name, proxy.port);
+    println!(
+        "Starting the proxy for {} on 127.0.0.1:{} ...",
+        p.name, proxy.port
+    );
     let mut cmd = Command::new(&exe);
     for a in &proxy.args {
         cmd.arg(expand(a));
@@ -133,7 +148,9 @@ fn host_is_up(host: &str) -> bool {
 }
 
 fn run_host_check(p: &Provider) -> Result<()> {
-    let Some(check) = &p.host_check else { return Ok(()) };
+    let Some(check) = &p.host_check else {
+        return Ok(());
+    };
     if host_is_up(&check.host) {
         return Ok(());
     }
@@ -299,8 +316,7 @@ fn opencode(cmd: &mut Command, sel: &Selection, token: Option<&str>) -> Result<(
     }
 
     // A provider with no base_url is one of OpenCode's own, already named by its id.
-    cmd.arg("--model")
-        .arg(format!("{pid}/{}", sel.model.id));
+    cmd.arg("--model").arg(format!("{pid}/{}", sel.model.id));
     Ok(())
 }
 
@@ -591,7 +607,7 @@ mod tests {
         for (i, a) in args.iter().enumerate() {
             if a == "-c" {
                 let v = &args[i + 1];
-                let after = v.splitn(2, '=').nth(1).unwrap();
+                let after = v.split_once('=').map(|(_, a)| a).unwrap();
                 assert!(
                     after.starts_with('"') && after.ends_with('"'),
                     "codex parses the value as TOML, so it must be quoted: {v}"

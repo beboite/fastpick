@@ -22,6 +22,13 @@ pub fn expand(raw: &str) -> PathBuf {
 
     s = expand_windows_style(&s);
     s = expand_unix_style(&s);
+
+    // `~/.acme/key` on Windows resolves to `C:\Users\me/.acme/key`, which works everywhere
+    // but is printed back to the user in error messages and by --paths. Anything holding a
+    // scheme is left alone: proxy arguments go through here too, and a URL is not a path.
+    if cfg!(windows) && !s.contains("://") {
+        s = s.replace('/', "\\");
+    }
     PathBuf::from(s)
 }
 
@@ -40,7 +47,7 @@ pub fn program(bin: &str) -> Command {
     let found = if named_path {
         expanded.exists().then_some(expanded.clone())
     } else {
-        which(bin)
+        find(bin)
     };
 
     let path = match found {
@@ -64,11 +71,23 @@ pub fn program(bin: &str) -> Command {
     Command::new(path)
 }
 
+/// Where a harness binary actually is, or `None` when it is not installed.
+///
+/// A name holding a separator is a path the user chose and is checked as written; a bare
+/// name is looked up on PATH the same way the launch will.
+pub fn locate(bin: &str) -> Option<PathBuf> {
+    if bin.contains('/') || bin.contains('\\') {
+        let p = expand(bin);
+        return p.is_file().then_some(p);
+    }
+    find(bin)
+}
+
 /// The first match for `bin` on PATH, trying PATHEXT extensions before the bare name.
 ///
 /// Extensions come first on purpose: npm leaves an extensionless shell script beside the
 /// `.cmd`, and picking that one up would hand a bash script to CreateProcess.
-fn which(bin: &str) -> Option<PathBuf> {
+fn find(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let exts: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
@@ -122,72 +141,6 @@ fn expand_windows_style(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_unknown_program_is_left_as_written() {
-        // Not invented into some path: the error the user sees has to name what they asked
-        // for, not a guess made here.
-        let cmd = program("fastpick-no-such-binary");
-        assert_eq!(
-            cmd.get_program().to_string_lossy(),
-            "fastpick-no-such-binary"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn a_batch_shim_is_handed_to_cmd() {
-        // ping.exe is always there and is a real executable, so it must NOT be wrapped.
-        let cmd = program("ping");
-        assert_ne!(cmd.get_program().to_string_lossy(), "cmd");
-
-        // Every npm-installed agent is a .cmd, which CreateProcess cannot run on its own.
-        let Some(shim) = which("npm") else { return };
-        if shim.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd")) {
-            let cmd = program("npm");
-            assert_eq!(cmd.get_program().to_string_lossy(), "cmd");
-            let args: Vec<String> = cmd
-                .get_args()
-                .map(|a| a.to_string_lossy().to_string())
-                .collect();
-            assert_eq!(args[0], "/c");
-            assert!(args[1].to_lowercase().ends_with("npm.cmd"));
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn an_extension_beats_the_extensionless_shell_script_beside_it() {
-        // npm leaves three files per binary: `npm`, `npm.cmd` and `npm.ps1`. The first is a
-        // bash script, and picking it would hand shell source to CreateProcess.
-        let Some(found) = which("npm") else { return };
-        assert!(
-            found.extension().is_some(),
-            "resolved the extensionless shim: {}",
-            found.display()
-        );
-    }
-
-    #[test]
-    fn an_unset_variable_stays_visible_instead_of_vanishing() {
-        let out = expand("$FASTPICK_NOT_SET_ANYWHERE/x").display().to_string();
-        assert!(out.contains("FASTPICK_NOT_SET_ANYWHERE"));
-        let out = expand("%FASTPICK_NOT_SET_ANYWHERE%/x").display().to_string();
-        assert!(out.contains("FASTPICK_NOT_SET_ANYWHERE"));
-    }
-
-    #[test]
-    fn a_tilde_becomes_the_home_directory() {
-        let Some(home) = dirs::home_dir() else { return };
-        let out = expand("~/.acme/key");
-        assert!(out.starts_with(&home), "{}", out.display());
-        assert!(out.display().to_string().ends_with("key"));
-    }
-}
-
 fn expand_unix_style(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.char_indices().peekable();
@@ -226,4 +179,75 @@ fn expand_unix_style(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_program_is_left_as_written() {
+        // Not invented into some path: the error the user sees has to name what they asked
+        // for, not a guess made here.
+        let cmd = program("fastpick-no-such-binary");
+        assert_eq!(
+            cmd.get_program().to_string_lossy(),
+            "fastpick-no-such-binary"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_batch_shim_is_handed_to_cmd() {
+        // ping.exe is always there and is a real executable, so it must NOT be wrapped.
+        let cmd = program("ping");
+        assert_ne!(cmd.get_program().to_string_lossy(), "cmd");
+
+        // Every npm-installed agent is a .cmd, which CreateProcess cannot run on its own.
+        let Some(shim) = find("npm") else { return };
+        if shim
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd"))
+        {
+            let cmd = program("npm");
+            assert_eq!(cmd.get_program().to_string_lossy(), "cmd");
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            assert_eq!(args[0], "/c");
+            assert!(args[1].to_lowercase().ends_with("npm.cmd"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_extension_beats_the_extensionless_shell_script_beside_it() {
+        // npm leaves three files per binary: `npm`, `npm.cmd` and `npm.ps1`. The first is a
+        // bash script, and picking it would hand shell source to CreateProcess.
+        let Some(found) = find("npm") else { return };
+        assert!(
+            found.extension().is_some(),
+            "resolved the extensionless shim: {}",
+            found.display()
+        );
+    }
+
+    #[test]
+    fn an_unset_variable_stays_visible_instead_of_vanishing() {
+        let out = expand("$FASTPICK_NOT_SET_ANYWHERE/x").display().to_string();
+        assert!(out.contains("FASTPICK_NOT_SET_ANYWHERE"));
+        let out = expand("%FASTPICK_NOT_SET_ANYWHERE%/x")
+            .display()
+            .to_string();
+        assert!(out.contains("FASTPICK_NOT_SET_ANYWHERE"));
+    }
+
+    #[test]
+    fn a_tilde_becomes_the_home_directory() {
+        let Some(home) = dirs::home_dir() else { return };
+        let out = expand("~/.acme/key");
+        assert!(out.starts_with(&home), "{}", out.display());
+        assert!(out.display().to_string().ends_with("key"));
+    }
 }
