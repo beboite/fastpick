@@ -154,8 +154,16 @@ and per kind of provider:
 
 Keys are referenced by file path and never inlined, and they never reach a config file or a
 command line: OpenCode gets `{env:FASTPICK_PROVIDER_KEY}` and Codex gets an `env_key`
-pointing at the same variable. `--dry-run` prints the resolved environment with the
-credentials replaced by their length.
+pointing at the same variable. `--dry-run` prints the resolved environment with anything
+named like a credential replaced by its length.
+
+Every variable an adapter owns is either set or removed, never left to whatever the shell
+exported. That is the difference between picking a third-party endpoint and sending your
+Anthropic key to it: `ANTHROPIC_API_KEY` is cleared whenever a provider brings its own
+`base_url`, whether or not it also brings a key, and `ANTHROPIC_BASE_URL` is cleared when
+you pick the agent's own login. A catalogue url on `http://` is refused outright unless it
+is loopback or `auth = "none"`, and model ids from a provider are checked against a plain
+allowlist before they can reach a command line.
 
 ## Build
 

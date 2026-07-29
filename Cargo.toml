@@ -2,8 +2,15 @@
 name = "fastpick"
 version = "0.2.1"
 edition = "2021"
+rust-version = "1.74"
 description = "Terminal picker that chooses a coding harness, a provider and a model, then launches it with the right environment"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/klNuno/fastpick"
+homepage = "https://github.com/klNuno/fastpick"
+keywords = ["cli", "tui", "llm", "launcher", "picker"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/.github"]
 
 [dependencies]
 anyhow = "1"

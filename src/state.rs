@@ -22,7 +22,9 @@ fn path() -> Option<PathBuf> {
 }
 
 pub fn load() -> State {
-    let Some(p) = path() else { return State::default() };
+    let Some(p) = path() else {
+        return State::default();
+    };
     let Ok(raw) = std::fs::read_to_string(p) else {
         return State::default();
     };
@@ -36,9 +38,17 @@ pub fn save(harness: &str, provider: &str, model: &str) {
         last_provider: Some(provider.to_string()),
         last_model: Some(model.to_string()),
     };
-    let Ok(raw) = toml::to_string_pretty(&state) else { return };
+    let Ok(raw) = toml::to_string_pretty(&state) else {
+        return;
+    };
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(p, raw);
+    // Written beside the target and renamed over it. A plain write truncates first, so two
+    // fastpick runs ending at the same moment can leave a half-written file, and the next
+    // start would quietly forget where the cursor was.
+    let tmp = p.with_extension("toml.tmp");
+    if std::fs::write(&tmp, raw).is_ok() && std::fs::rename(&tmp, &p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

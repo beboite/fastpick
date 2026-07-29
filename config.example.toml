@@ -1,7 +1,10 @@
 # fastpick config
 #
-# Written to your config directory on first run and yours to edit. Nothing here is a
-# secret: keys are referenced by file path, never inlined.
+# Written to your config directory on first run and yours to edit. Keys belong in a file of
+# their own, named here by `auth_token_file`, never pasted into this one. The `env` tables
+# further down are the one place where a key would fit, and they are the one place not to
+# put it: their values are printed in full by `--dry-run`, which is the output people paste
+# into bug reports.
 #
 # Two kinds of block, and the menu asks for them in this order.
 #
@@ -19,7 +22,11 @@
 # what no API reports: a nicer name, a context window, effort levels, or an id that works
 # but is not advertised.
 
-system_prompts_dir = "~/.config/fastpick/system-prompts"
+# Where the .md files offered as system prompts live. Left commented on purpose: unset, it
+# is `system-prompts` next to this file, which is the folder the first run just created,
+# and that path is right on every platform. Writing `~/.config/fastpick/system-prompts`
+# here would be wrong on Windows, where this file lives under %APPDATA%.
+# system_prompts_dir = "~/my-prompts"
 
 # How long a fetched catalogue stays fresh. `tab` in the menu refetches on demand.
 catalog_ttl_secs = 21600
@@ -52,6 +59,15 @@ bin = "codex"
 # Takes dotted TOML overrides with -c, so ~/.codex/config.toml is never written to.
 # No system prompt row: Codex has no append-only surface for one, and its instructions
 # override would replace the base prompt, tool rules included.
+
+# Every harness also takes these two, left out above because most setups need neither:
+#
+#   extra_args = ["--verbose"]   appended to every launch of this harness, whatever the
+#                                provider. A per-provider equivalent lives on the binding.
+#   note = "..."                 one line shown under the name in the menu.
+#
+# `bin` may be a bare name resolved through PATH, or a path. On Windows the npm shim is
+# found and run correctly either way, including the .cmd one that CreateProcess refuses.
 
 
 # ============================================================================= providers
@@ -131,6 +147,21 @@ small_fast_model = "example-small"
   label = "Example Large"
   context_window = 1000000
   compact_ratio = 0.9
+  # small_fast_model = "example-tiny"   overrides the provider's, for this model only
+
+  # Anything the adapters do not cover, per provider or per binding. Values are passed to
+  # the agent as written.
+  #
+  #   [provider.env]                          on every harness this provider serves
+  #   MY_VARIABLE = "value"
+  #
+  #   [provider.harness.opencode.env]         on this harness only, and wins over the above
+  #   MY_VARIABLE = "other value"
+  #
+  #   [provider.harness.opencode]
+  #   extra_args = ["--print-logs"]           appended for this pair only
+  #
+  # Not a place for a key. `--dry-run` prints these verbatim.
 
 
 # --------------------------------------------------------------------------- proxied
@@ -153,11 +184,20 @@ auth_token_file = "~/.some-proxy/client.key"
   timeout_secs = 15
   logs_hint = "~/.some-proxy/logs/"
 
+  # Loopback, so http is fine here and the key never reaches a network. Any other host
+  # with an `auth` other than "none" has to be https, and is refused otherwise.
   [provider.catalog]
   url = "http://127.0.0.1:4000/v1/models"
 
   [provider.harness.claude-code]
   base_url = "http://127.0.0.1:4000"
+
+  # A declared model matters more here than anywhere else: the proxy only starts at launch,
+  # so the catalogue above cannot answer while the menu is open and the model list would
+  # otherwise be empty with no way forward.
+  [[provider.model]]
+  id = "example-large"
+  label = "Example Large (proxied)"
 
 
 # ----------------------------------------------------------------------------- local
@@ -168,7 +208,7 @@ auth_token_file = "~/.some-proxy/client.key"
 id = "example-local"
 name = "Local model"
 group = "local"
-auth_token_file = "~/.fastpick/local.key"
+auth_token_file = "~/.example-local/client.key"
 small_fast_model = "local-model"
 
   [provider.host_check]

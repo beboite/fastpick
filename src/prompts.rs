@@ -24,11 +24,22 @@ pub fn all_in(dir: &Path) -> Vec<PromptFile> {
     };
     let mut out: Vec<PromptFile> = entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("md")))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("md"))
+        })
+        // A directory named `something.md` would otherwise be offered as a prompt and then
+        // fail at launch, inside the agent, with an error about a file it cannot read.
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|e| {
             let path = e.path();
             let stem = path.file_stem()?.to_string_lossy().to_string();
-            Some(PromptFile { path, stem, score: 0 })
+            Some(PromptFile {
+                path,
+                stem,
+                score: 0,
+            })
         })
         .collect();
     out.sort_by(|a, b| a.stem.to_lowercase().cmp(&b.stem.to_lowercase()));

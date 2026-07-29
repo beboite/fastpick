@@ -11,7 +11,7 @@ use ratatui::DefaultTerminal;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::catalog::{self, Source};
 use crate::config::{Config, Model};
@@ -86,6 +86,11 @@ pub struct App<'a> {
     /// Set when the harness cannot do something the model offers, so the options screen
     /// explains the absence rather than silently hiding a row.
     unsupported: Vec<String>,
+
+    /// One line explaining why the menu opened when the command line asked it not to.
+    /// Carried here rather than printed: anything written to the terminal before
+    /// `ratatui::init()` is wiped by the switch to the alternate screen a moment later.
+    notice: Option<String>,
 }
 
 impl<'a> App<'a> {
@@ -116,6 +121,7 @@ impl<'a> App<'a> {
             effort_idx: None,
             opt_row: 0,
             unsupported: Vec::new(),
+            notice: None,
         };
         app.rebuild_providers();
         if let Some(pi) = start.provider_idx {
@@ -161,6 +167,17 @@ impl<'a> App<'a> {
             .collect();
     }
 
+    /// Refetches for the provider already on screen, keeping what the user has typed.
+    ///
+    /// Separate from `load_models` because that one is entering the screen, where a filter
+    /// from the previous provider makes no sense. Here the user asked for fresher data
+    /// about the list in front of them and expects to still be looking at it.
+    pub fn refresh_models(&mut self) {
+        let filter = std::mem::take(&mut self.filter);
+        self.load_models(true);
+        self.filter = filter;
+    }
+
     /// Kicks off the catalogue lookup for the selected provider. Returns immediately.
     pub fn load_models(&mut self, force: bool) {
         let Some(p) = self.provider() else { return };
@@ -181,11 +198,28 @@ impl<'a> App<'a> {
 
     fn poll_models(&mut self) {
         let Some(rx) = &self.rx else { return };
-        if let Ok((models, source)) = rx.try_recv() {
-            self.models = models;
-            self.source = Some(source);
-            self.rx = None;
-            self.rebuild_models();
+        match rx.try_recv() {
+            Ok((models, source)) => {
+                self.models = models;
+                self.source = Some(source);
+                self.rx = None;
+                self.rebuild_models();
+            }
+            // The sender is gone without having sent, which means the fetch thread died.
+            // Treated as a failure rather than ignored: leaving `rx` in place would spin
+            // the loading indicator for ever with nothing left to answer it.
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.rx = None;
+                self.models = self
+                    .provider()
+                    .map(|p| p.models.clone())
+                    .unwrap_or_default();
+                self.source = Some(catalog::Source::Failed(
+                    "the lookup stopped without answering".into(),
+                ));
+                self.rebuild_models();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
     }
 
@@ -212,10 +246,23 @@ impl<'a> App<'a> {
     }
 
     /// Selects a model by id without going through the list, for `--model`.
+    ///
+    /// Reports failure when the id is not on screen, rather than falling back to the first
+    /// row. `unwrap_or(0)` here used to answer "selected" while pointing at a different
+    /// model, so `--model x` could launch y with nothing said about it.
     pub fn select_model_id(&mut self, id: &str) -> bool {
-        match self.models.iter().position(|m| m.id == id) {
-            Some(i) => {
-                self.model_idx = self.visible_models.iter().position(|&v| v == i).unwrap_or(0);
+        let Some(i) = self.models.iter().position(|m| m.id == id) else {
+            return false;
+        };
+        // A filter left over from an earlier screen can hide a model that does exist. The
+        // named one wins over the filter.
+        if !self.visible_models.contains(&i) {
+            self.filter.clear();
+            self.rebuild_models();
+        }
+        match self.visible_models.iter().position(|&v| v == i) {
+            Some(row) => {
+                self.model_idx = row;
                 true
             }
             None => false,
@@ -259,7 +306,9 @@ impl<'a> App<'a> {
             return;
         }
 
-        let Some(dir) = self.cfg.prompts_dir() else { return };
+        let Some(dir) = self.cfg.prompts_dir() else {
+            return;
+        };
         let Some(model) = self.model() else { return };
         let base = model.base_name().to_string();
 
@@ -275,7 +324,9 @@ impl<'a> App<'a> {
         if !self.harness().kind.supports_system_prompts() {
             return;
         }
-        let Some(dir) = self.cfg.prompts_dir() else { return };
+        let Some(dir) = self.cfg.prompts_dir() else {
+            return;
+        };
         let Some(model) = self.model() else { return };
         let base = model.base_name().to_string();
 
@@ -356,18 +407,37 @@ pub fn run(cfg: &Config, start: &Start) -> Result<Option<Picked>> {
         app.load_models(false);
 
         if let Some(id) = pending_model.clone() {
-            while app.loading() {
+            // Bounded at the consumer rather than trusting the client timeout. ureq applies
+            // its deadline to the connection and the transfer but not to the DNS lookup, so
+            // a wedged resolver blocks the fetch thread for the OS timeout, minutes, and
+            // this loop would show a blank terminal for all of it with no way out.
+            let began = Instant::now();
+            let deadline = began + Duration::from_secs(20);
+            let mut said = false;
+            while app.loading() && Instant::now() < deadline {
+                // No alternate screen on this path, so a line here survives. Anything
+                // slower than a blink needs to say what it is waiting for.
+                if !said && began.elapsed() > Duration::from_secs(1) {
+                    eprintln!("fastpick: asking the provider what it serves...");
+                    said = true;
+                }
                 app.poll_models();
                 std::thread::sleep(Duration::from_millis(20));
             }
             pending_model = None;
-            if app.select_model_id(&id) {
+            if !app.loading() && app.select_model_id(&id) {
                 app.enter_options();
                 return Ok(app.picked());
             }
-            // Unknown id. Rather than launching something else, open the list with the
-            // name already typed into the filter so the near misses are on screen.
-            eprintln!("fastpick: `{id}` is not in this provider's catalogue, pick from the list.");
+            // Unknown id, or the catalogue never answered. Rather than launching something
+            // else, open the list with the name already in the filter so the near misses
+            // are on screen. The reason goes on the status line: printing it here would be
+            // wiped by the switch to the alternate screen two lines below.
+            app.notice = Some(if app.loading() {
+                format!("the catalogue did not answer in time, so `{id}` could not be checked")
+            } else {
+                format!("`{id}` is not in this provider's catalogue, pick from the list")
+            });
             app.filter = id;
             app.rebuild_models();
         }
@@ -401,6 +471,9 @@ fn event_loop(
                 }
                 // Unknown id: fall back to the list rather than launching something else.
                 // The filter is pre-filled so the near misses are already on screen.
+                app.notice = Some(format!(
+                    "`{id}` is not in this provider's catalogue, pick from the list"
+                ));
                 app.filter = id;
                 app.rebuild_models();
             }
@@ -408,15 +481,28 @@ fn event_loop(
 
         terminal.draw(|f| draw(f, app))?;
 
-        if !event::poll(Duration::from_millis(if app.loading() { 100 } else { 500 }))? {
+        // Only the spinner needs a tick, and only while something is in flight. Waking
+        // twice a second on an idle menu redrew the whole screen for nothing; a resize or
+        // a keypress still wakes the poll immediately.
+        let wait = if app.loading() {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(3600)
+        };
+        if !event::poll(wait)? {
             app.spinner = app.spinner.wrapping_add(1);
             continue;
         }
 
-        let Event::Key(key) = event::read()? else { continue };
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        // Read once, then gone: it explains the screen the user just landed on, and past
+        // that it would sit on top of the catalogue line for the rest of the session.
+        app.notice = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(None);
         }
@@ -476,14 +562,20 @@ fn event_loop(
                     app.filter.pop();
                     app.rebuild_models();
                 }
-                KeyCode::Tab => app.load_models(true),
+                KeyCode::Tab => app.refresh_models(),
                 KeyCode::Enter => {
                     if app.model().is_some() {
                         app.enter_options();
                         app.set_screen(Screen::Options);
                     }
                 }
-                KeyCode::Char(c) => {
+                // A modifier means a shortcut, not a character to filter on. Without the
+                // guard, Ctrl+V and Alt+F typed `v` and `f` into the filter.
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     app.filter.push(c);
                     app.model_idx = 0;
                     app.rebuild_models();
@@ -655,7 +747,20 @@ fn render_rows(f: &mut Frame, area: Rect, rows: Vec<Row>, selected: usize) {
         }
     }
 
-    let mut state = ListState::default().with_selected(Some(cursor));
+    // A default `ListState` starts at offset 0 on every frame, and ratatui then scrolls the
+    // minimum needed to reveal the selection, which parks it on the last visible row: on a
+    // catalogue longer than the viewport the user never sees what comes after the cursor.
+    // Computing the offset keeps a few rows of context below it instead.
+    let height = area.height.max(1) as usize;
+    let margin = (height / 4).min(3);
+    let offset = (cursor + margin + 1)
+        .saturating_sub(height)
+        .min(items.len().saturating_sub(height))
+        .min(cursor);
+
+    let mut state = ListState::default()
+        .with_selected(Some(cursor))
+        .with_offset(offset);
     f.render_stateful_widget(
         List::new(items)
             .highlight_symbol("> ")
@@ -703,6 +808,11 @@ fn help(app: &App) -> &'static str {
 }
 
 fn status(app: &App) -> String {
+    // Outranks the catalogue line: it is the answer to "why am I looking at a menu I asked
+    // to skip", and the user has not seen it anywhere else.
+    if let Some(n) = &app.notice {
+        return n.clone();
+    }
     match app.screen {
         Screen::Model => match (&app.source, app.loading()) {
             (_, true) => format!(
@@ -771,7 +881,9 @@ fn provider_body(app: &App) -> Body {
     let mut rows = Vec::new();
     let mut current: Option<&str> = None;
     for (row, &i) in app.provider_rows.iter().enumerate() {
-        let Some(p) = app.cfg.providers.get(i) else { continue };
+        let Some(p) = app.cfg.providers.get(i) else {
+            continue;
+        };
 
         // A heading opens each block, and the blocks are separated by a blank line. Two
         // entries that are the same site with a different key belong under one heading, so
@@ -789,7 +901,10 @@ fn provider_body(app: &App) -> Body {
 
         let mut spans = vec![Span::raw(p.name.clone())];
         if let Some(n) = app.provider_counts.get(row).copied().flatten() {
-            spans.push(Span::styled(count(n, "model"), Style::new().fg(Color::Blue)));
+            spans.push(Span::styled(
+                count(n, "model"),
+                Style::new().fg(Color::Blue),
+            ));
         }
         if let Some(note) = &p.note {
             spans.push(dim(format!("   {note}")));
@@ -857,7 +972,11 @@ fn options_body(app: &App) -> Body {
         rows.push(Row::Heading("system prompt".to_string()));
     }
     for (i, file) in app.prompt_files.iter().enumerate() {
-        let mark = if app.checked.contains(&i) { "[x] " } else { "[ ] " };
+        let mark = if app.checked.contains(&i) {
+            "[x] "
+        } else {
+            "[ ] "
+        };
         let matched = i < app.prompt_matches;
         let mut spans = vec![
             Span::styled(mark, Style::new().fg(Color::Green)),

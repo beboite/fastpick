@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config::{Catalog, Config, Model, Provider};
+use crate::config::{Catalog, CatalogAuth, Config, Model, Provider};
 use crate::paths::expand;
 
 /// Everything a lookup needs, owned, so it can run on a background thread while the menu
@@ -61,8 +61,12 @@ struct Cached {
 pub enum Source {
     /// Fetched just now.
     Live(usize),
-    /// Read from disk, with its age in seconds.
+    /// Read from disk because it was still fresh, with its age in seconds.
     Cache(usize, u64),
+    /// Read from disk because the fetch failed, with its age and the reason it failed.
+    /// Kept apart from `Cache` so a provider broken by a revoked key stops looking healthy
+    /// for as long as its cache survives.
+    Stale(usize, u64, String),
     /// No catalogue declared, the config list is the whole truth.
     Config(usize),
     /// The fetch failed and nothing was cached, so the config list is all there is.
@@ -74,6 +78,9 @@ impl Source {
         match self {
             Source::Live(n) => format!("{n} models, live"),
             Source::Cache(n, age) => format!("{n} models, cached {}", human_age(*age)),
+            Source::Stale(n, age, e) => {
+                format!("{n} models, cached {} ({e})", human_age(*age))
+            }
             Source::Config(n) => format!("{n} models, from the config"),
             Source::Failed(e) => format!("catalogue unreachable ({e}), config list only"),
         }
@@ -103,9 +110,29 @@ fn cache_path(provider_id: &str) -> Option<PathBuf> {
     // The id is used as a file name, so keep it to something a file system accepts.
     let safe: String = provider_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    crate::config::config_dir().map(|d| d.join("catalog").join(format!("{safe}.json")))
+    // Collapsing every other character to `_` makes `acme.a`, `acme-a` and `acme_a` the
+    // same file, and one provider would then show another's models. The suffix keeps the
+    // name readable while making it unique again.
+    let tag = fnv1a(provider_id);
+    crate::config::config_dir().map(|d| d.join("catalog").join(format!("{safe}-{tag:08x}.json")))
+}
+
+/// FNV-1a, 32 bits. Not a checksum, just enough to tell two ids apart in a file name.
+fn fnv1a(s: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in s.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 fn read_token(token_file: Option<&String>) -> Option<String> {
@@ -127,16 +154,23 @@ fn fetch(r: &Request) -> Result<Vec<Entry>> {
         .as_ref()
         .ok_or_else(|| anyhow!("no catalogue declared"))?;
 
-    let mut req = ureq::get(&cat.url).timeout(Duration::from_secs(15));
-    match cat.auth.as_str() {
-        "none" => {}
-        "x-api-key" => {
+    // `redirects(0)` is not a preference. ureq strips `authorization` and `cookie` when it
+    // follows a redirect, but not `x-api-key`, so a catalogue host answering 302 would be
+    // handed the raw Anthropic key for whatever location it names.
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(15))
+        .build();
+    let mut req = agent.get(&cat.url);
+    match cat.auth {
+        CatalogAuth::None => {}
+        CatalogAuth::XApiKey => {
             let token = read_token(r.token_file.as_ref())
                 .ok_or_else(|| anyhow!("no key file to authenticate with"))?;
             req = req.set("x-api-key", &token);
             req = req.set("anthropic-version", "2023-06-01");
         }
-        _ => {
+        CatalogAuth::Bearer => {
             let token = read_token(r.token_file.as_ref())
                 .ok_or_else(|| anyhow!("no key file to authenticate with"))?;
             req = req.set("Authorization", &format!("Bearer {token}"));
@@ -149,18 +183,36 @@ fn fetch(r: &Request) -> Result<Vec<Entry>> {
         .into_json()
         .context("the catalogue answered something that is not JSON")?;
 
-    let items = body
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| anyhow!("no `data` array in the answer"))?;
+    let items = match body.get("data").and_then(|d| d.as_array()) {
+        Some(items) => items,
+        None => {
+            // Several providers answer 200 with an error object. Reporting "no `data`
+            // array" there throws away the one sentence that says what went wrong.
+            let reason = body
+                .get("error")
+                .and_then(|e| e.get("message").or(Some(e)))
+                .map(|m| m.as_str().map(|s| s.to_string()).unwrap_or(m.to_string()));
+            return Err(match reason {
+                Some(r) => anyhow!("the catalogue refused: {}", first_line(&r)),
+                None => anyhow!("no `data` array in the answer"),
+            });
+        }
+    };
 
     let mut out = Vec::new();
+    let mut refused = 0usize;
     for item in items {
         let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
-        if !cat.only_prefixes.is_empty()
-            && !cat.only_prefixes.iter().any(|pre| id.starts_with(pre))
+        // The id travels to a command line, and on Windows through `cmd.exe` on the way.
+        // This is a remote answer, so the id is a value the server picks: anything that is
+        // not a plain name is dropped rather than trusted.
+        if !crate::config::model_id_is_plain(id) {
+            refused += 1;
+            continue;
+        }
+        if !cat.only_prefixes.is_empty() && !cat.only_prefixes.iter().any(|pre| id.starts_with(pre))
         {
             continue;
         }
@@ -180,16 +232,54 @@ fn fetch(r: &Request) -> Result<Vec<Entry>> {
         });
     }
     if out.is_empty() {
-        return Err(anyhow!("the catalogue listed no usable model"));
+        return Err(match (items.is_empty(), refused) {
+            (true, _) => anyhow!("the catalogue is empty"),
+            (false, n) if n == items.len() => {
+                anyhow!("the catalogue answered {n} models and none has a usable id")
+            }
+            // Distinguishable from an outage on purpose: an `only_prefixes` or
+            // `exclude_contains` that is one character off looks exactly like a dead
+            // endpoint otherwise.
+            _ => anyhow!(
+                "the filters dropped all {} models the catalogue listed",
+                items.len()
+            ),
+        });
     }
     Ok(out)
 }
 
+fn first_line(s: &str) -> String {
+    let line = s.lines().next().unwrap_or(s).trim();
+    if line.chars().count() > 200 {
+        format!("{}...", line.chars().take(200).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
 /// ureq renders a failed call as several lines including the whole body. One line is
 /// enough on a status bar.
+///
+/// The body is read rather than dropped: a bare `HTTP 401` reads the same for a wrong key,
+/// an expired key, a wrong url path and a wrong organisation, and that is the failure users
+/// actually hit.
 fn short_http_error(e: ureq::Error) -> String {
     match e {
-        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+        ureq::Error::Status(code, r) => {
+            // A 3xx only reaches here because redirects are off, and "HTTP 302" would say
+            // nothing about why the key was not sent along.
+            if (300..400).contains(&code) {
+                let to = r.header("location").unwrap_or("elsewhere").to_string();
+                return format!("HTTP {code}: the catalogue redirects to {to}, not followed because the key must not travel there. Point `url` at the final address.");
+            }
+            match r.into_string() {
+                Ok(body) if !body.trim().is_empty() => {
+                    format!("HTTP {code}: {}", first_line(&body))
+                }
+                _ => format!("HTTP {code}"),
+            }
+        }
         ureq::Error::Transport(t) => {
             let s = t.to_string();
             s.lines().next().unwrap_or("transport error").to_string()
@@ -211,7 +301,9 @@ pub fn cached_count(config_models: &[Model], provider_id: &str) -> Option<usize>
 }
 
 fn write_cache(provider_id: &str, models: &[Entry]) {
-    let Some(path) = cache_path(provider_id) else { return };
+    let Some(path) = cache_path(provider_id) else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -219,8 +311,15 @@ fn write_cache(provider_id: &str, models: &[Entry]) {
         fetched_at: now(),
         models: models.to_vec(),
     };
-    if let Ok(raw) = serde_json::to_string(&payload) {
-        let _ = std::fs::write(path, raw);
+    let Ok(raw) = serde_json::to_string(&payload) else {
+        return;
+    };
+    // Written beside the target and renamed over it. A plain write truncates first, so a
+    // second fastpick refreshing the same provider, or a kill halfway through, leaves a
+    // half-file that parses as nothing and silently drops the whole catalogue.
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, raw).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -230,18 +329,21 @@ fn write_cache(provider_id: &str, models: &[Entry]) {
 /// degrades one step rather than erroring: live, then cache, then the config list.
 pub fn run(r: &Request) -> (Vec<Model>, Source) {
     if r.catalog.is_none() {
-        return (r.config_models.clone(), Source::Config(r.config_models.len()));
+        return (
+            r.config_models.clone(),
+            Source::Config(r.config_models.len()),
+        );
     }
 
     let cached = read_cache(&r.provider_id);
     let fresh = cached
         .as_ref()
-        .filter(|c| !r.force && now().saturating_sub(c.fetched_at) < r.ttl_secs);
+        .filter(|c| !r.force && age_of(c).is_some_and(|age| age < r.ttl_secs));
 
     if let Some(c) = fresh {
         let merged = merge(&r.config_models, &c.models);
         let n = merged.len();
-        return (merged, Source::Cache(n, now().saturating_sub(c.fetched_at)));
+        return (merged, Source::Cache(n, age_of(c).unwrap_or(0)));
     }
 
     match fetch(r) {
@@ -255,14 +357,26 @@ pub fn run(r: &Request) -> (Vec<Model>, Source) {
             Some(c) => {
                 let merged = merge(&r.config_models, &c.models);
                 let n = merged.len();
-                (merged, Source::Cache(n, now().saturating_sub(c.fetched_at)))
+                // The age alone would read as "simply not expired yet" and a provider
+                // broken by a revoked key would look healthy for as long as the cache
+                // survives. The reason travels with it.
+                (
+                    merged,
+                    Source::Stale(n, age_of(&c).unwrap_or(0), e.to_string()),
+                )
             }
-            None => (
-                r.config_models.clone(),
-                Source::Failed(e.to_string()),
-            ),
+            None => (r.config_models.clone(), Source::Failed(e.to_string())),
         },
     }
+}
+
+/// How long ago the cache was written, or `None` if it claims to come from the future.
+///
+/// A `fetched_at` ahead of the clock means the machine's time moved back, or the file was
+/// copied from another machine. Subtracting saturates to 0 there, which reads as "written
+/// this second" and pins the entry fresh until the clock catches up.
+fn age_of(c: &Cached) -> Option<u64> {
+    now().checked_sub(c.fetched_at)
 }
 
 /// Config first, then whatever the provider listed.

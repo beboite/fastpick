@@ -111,10 +111,86 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
                 args.passthrough.extend(it);
                 break;
             }
+            // A near miss on a fastpick option is a typo, not something to forward. Passed
+            // through, `--modle gpt-5` silently opened the full menu and handed the agent
+            // an argument it does not know either.
+            _ if looks_like_a_typo(&a) => {
+                return Err(format!("unknown option `{a}`. Use `--` before it if the agent is meant to receive it, or see --help."));
+            }
             _ => args.passthrough.push(a),
         }
     }
+    if args.no_md && !args.md.is_empty() {
+        return Err("--md and --no-md contradict each other".into());
+    }
     Ok(Some(args))
+}
+
+/// Whether an unrecognised `--word` is close enough to one of ours to be a mistake.
+///
+/// Everything else is forwarded, because forwarding is the documented behaviour that makes
+/// `fastpick -p "hello"` work. Only a one-character slip on a known name is refused.
+fn looks_like_a_typo(a: &str) -> bool {
+    const KNOWN: [&str; 9] = [
+        "--config",
+        "--list",
+        "--dry-run",
+        "--refresh",
+        "--harness",
+        "--provider",
+        "--model",
+        "--effort",
+        "--no-md",
+    ];
+    let Some(name) = a.split('=').next() else {
+        return false;
+    };
+    if !name.starts_with("--") || KNOWN.contains(&name) || name == "--md" || name == "--help" {
+        return false;
+    }
+    KNOWN.iter().any(|k| is_near_miss(name, k))
+}
+
+/// One slip apart: a substitution, an insertion, a deletion, or two adjacent letters
+/// swapped. Bounded at one on purpose, so a genuinely different flag is never called a typo
+/// and stays forwarded to the agent.
+fn is_near_miss(a: &str, b: &str) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+
+    if a.len() == b.len() {
+        let diffs: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+        return match diffs[..] {
+            [_] => true,
+            // A swap is two substitutions, so it needs its own arm, and it is the most
+            // common way to mistype a word.
+            [i, j] => j == i + 1 && a[i] == b[j] && a[j] == b[i],
+            _ => false,
+        };
+    }
+
+    // One insertion or deletion: the shorter must be the longer with exactly one character
+    // skipped.
+    let (short, long) = if a.len() < b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    let mut i = 0;
+    let mut skipped = false;
+    for c in long.iter() {
+        if i < short.len() && short[i] == *c {
+            i += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+        }
+    }
+    i == short.len()
 }
 
 fn real_main() -> Result<i32> {
@@ -135,6 +211,19 @@ fn real_main() -> Result<i32> {
     }
 
     let cfg = config::Config::load(&cfg_path)?;
+
+    // Before `--list`, not after. Listing used to run first, so `--list --provider typo`
+    // printed the whole catalogue and exited 0 as though the id had been honoured.
+    if let Some(id) = &args.harness {
+        if !cfg.harnesses.iter().any(|h| &h.id == id) {
+            anyhow::bail!("no harness with id `{id}`, see --list");
+        }
+    }
+    if let Some(id) = &args.provider {
+        if !cfg.providers.iter().any(|p| &p.id == id) {
+            anyhow::bail!("no provider with id `{id}`, see --list");
+        }
+    }
 
     if args.list {
         print_list(&cfg, &args)?;
@@ -263,7 +352,9 @@ fn resolve_prompts(
     let dir = cfg.prompts_dir();
 
     if args.md.is_empty() {
-        let Some(dir) = dir else { return Ok(Vec::new()) };
+        let Some(dir) = dir else {
+            return Ok(Vec::new());
+        };
         return Ok(prompts::matches_for(&dir, model.base_name())
             .into_iter()
             .take(1)
@@ -340,24 +431,43 @@ fn print_list(cfg: &config::Config, args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Whether a variable's value must not be printed.
+///
+/// By pattern, not by a list of three names. `build` copies arbitrary pairs out of
+/// `[provider.env]` and `[provider.harness.*.env]`, so a user who supplies their key as
+/// `OPENAI_API_KEY` would otherwise have it echoed in full into the output people paste
+/// into bug reports.
+///
+/// The exceptions are named because they are the reason `--dry-run` is read at all: both
+/// carry `TOKEN` in the name and neither is one.
+fn is_secret_env(key: &str) -> bool {
+    const NOT_SECRETS: [&str; 2] = [
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    ];
+    if NOT_SECRETS.contains(&key) {
+        return false;
+    }
+    let upper = key.to_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"]
+        .iter()
+        .any(|needle| upper.contains(needle))
+}
+
 fn print_dry_run(cfg: &config::Config, sel: &launch::Selection) -> Result<()> {
     let cmd = launch::build(cfg, sel)?;
     println!("env:");
     for (k, v) in cmd.get_envs() {
         let key = k.to_string_lossy();
-        let val = v.map(|v| v.to_string_lossy().to_string()).unwrap_or_default();
-        // The credentials are the one thing in here that must not be echoed. Matched by
-        // exact name, not substring: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` also contains
-        // `TOKEN` and hiding its value would gut the output people use --dry-run for.
-        let shown = if key == "ANTHROPIC_AUTH_TOKEN"
-            || key == "ANTHROPIC_API_KEY"
-            || key == launch::KEY_ENV
-        {
-            if val.is_empty() {
-                "(cleared)".to_string()
-            } else {
-                format!("({} chars, hidden)", val.len())
-            }
+        let Some(raw) = v else {
+            // Told to unset rather than to set. Worth showing: "this variable is being
+            // taken away from the child" is half of what --dry-run exists to answer.
+            println!("  {key} (removed)");
+            continue;
+        };
+        let val = raw.to_string_lossy().to_string();
+        let shown = if is_secret_env(&key) {
+            format!("({} chars, hidden)", val.len())
         } else {
             val
         };
@@ -375,4 +485,56 @@ fn print_dry_run(cfg: &config::Config, sel: &launch::Selection) -> Result<()> {
         println!("precheck: ping {} ({})", check.host, check.on_down);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anything_that_looks_like_a_credential_is_hidden() {
+        // Matched by pattern, because `build` copies arbitrary pairs out of the config's
+        // `env` tables and a user's key can be called anything.
+        for k in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "MY_SECRET",
+            "DB_PASSWORD",
+            "gh_token",
+        ] {
+            assert!(is_secret_env(k), "{k} should be hidden");
+        }
+    }
+
+    #[test]
+    fn the_two_variables_dry_run_exists_for_are_not_hidden() {
+        // Both carry TOKEN or KEY in the name and neither is one. Hiding them would gut
+        // the output people run --dry-run to read.
+        assert!(!is_secret_env("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
+        assert!(!is_secret_env("CLAUDE_CODE_AUTO_COMPACT_WINDOW"));
+        assert!(!is_secret_env("ANTHROPIC_BASE_URL"));
+        assert!(!is_secret_env("ANTHROPIC_SMALL_FAST_MODEL"));
+    }
+
+    #[test]
+    fn a_one_character_slip_is_caught_and_a_real_agent_flag_is_not() {
+        for typo in ["--modle", "--mode", "--provder", "--harnes", "--efort"] {
+            assert!(looks_like_a_typo(typo), "{typo} should be refused");
+        }
+        // Everything else is forwarded, which is what makes `fastpick -p "hello"` work.
+        for ok in [
+            "--print",
+            "--verbose",
+            "--resume",
+            "--permission-mode",
+            "-p",
+            "--md",
+            "--help",
+            "--model",
+        ] {
+            assert!(!looks_like_a_typo(ok), "{ok} should be forwarded");
+        }
+    }
 }
