@@ -15,6 +15,7 @@ fastpick --harness opencode                     # skip the first screen
 fastpick --harness codex --provider acme --model acme-large        # no menu at all
 fastpick --list --provider acme                 # what that provider serves right now
 fastpick --dry-run                              # the exact command and environment
+fastpick --list --json                          # the same, for another program
 ```
 
 Each of `--harness`, `--provider` and `--model` skips its own screen. The menu opens on the
@@ -156,6 +157,32 @@ Keys are referenced by file path and never inlined, and they never reach a confi
 command line: OpenCode gets `{env:FASTPICK_PROVIDER_KEY}` and Codex gets an `env_key`
 pointing at the same variable. `--dry-run` prints the resolved environment with the
 credentials replaced by their length.
+
+## Driving it from another program
+
+`--json` turns `--list` and `--dry-run` into machine output, so an editor or a terminal
+multiplexer can offer the same three choices in its own interface and then launch fastpick
+with them. Nothing else has to be reimplemented: the key files, the proxy it starts, the
+host it wakes and the environment it builds stay on this side.
+
+```
+fastpick --list --json                    # harnesses, providers, bindings. No network
+fastpick --list --json --provider acme    # and that provider's models, cache first
+fastpick --harness claude-code --provider acme --model acme-large   # launch, no menu
+```
+
+Exit code 0 means stdout holds one JSON document and nothing else; notices and errors go to
+stderr. The payload carries a `schema` number, bumped only when a consumer would have to
+change.
+
+Two things are deliberately absent. A provider reports `needsKey` and `keyPresent` but
+never where its key file is and never what is in it, and `--dry-run --json` names the
+credential variables under `secretEnv` with their length alone. So the picking can happen
+anywhere, while the secret is only ever read on the machine that runs the agent.
+
+Listing the models means one HTTP call, which is why they only appear when `--provider` is
+named. The answer is cached, so a caller can open its own menu without waiting; `--refresh`
+is the explicit way to go and look again.
 
 ## Build
 

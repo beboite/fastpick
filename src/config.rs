@@ -8,7 +8,7 @@
 //! for those.
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -39,7 +39,7 @@ fn default_catalog_ttl() -> u64 {
 /// Which built-in adapter drives a harness. The launch differs enough between agents that
 /// this is code rather than more config: they disagree on how a model is named, how a
 /// custom endpoint is declared, and whether extra instructions can be appended at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessKind {
     ClaudeCode,

@@ -8,6 +8,7 @@
 
 mod catalog;
 mod config;
+mod json;
 mod launch;
 mod paths;
 mod prompts;
@@ -28,6 +29,7 @@ OPTIONS
   -c, --config <file>    config file to use (default: the per-user one, see PATHS)
   -l, --list             print the harnesses, providers and models, then exit
   -n, --dry-run          show the command and environment a launch would use, run nothing
+      --json             print --list or --dry-run as JSON instead, for another program
   -r, --refresh          refetch the model catalogue instead of using the cached one
       --harness <id>     skip the harness screen
       --provider <id>    skip the provider screen
@@ -43,6 +45,11 @@ Each of --harness, --provider and --model skips its own screen; the menu opens o
 first one you left out. Anything not recognised is forwarded to the agent, so
 `fastpick -p \"hello\"` works. Use `--` when an argument would otherwise be read as a
 fastpick option.
+
+Under --json, exit code 0 means stdout holds one JSON document and nothing else; every
+notice and every error goes to stderr. `--list --json` describes the config without
+touching the network, and adding --provider <id> also lists that provider's models.
+No credential is ever printed, in either mode.
 
 KEYS
   up/down   move             enter   select / launch
@@ -72,6 +79,7 @@ struct Args {
     config: Option<PathBuf>,
     list: bool,
     dry_run: bool,
+    json: bool,
     refresh: bool,
     harness: Option<String>,
     provider: Option<String>,
@@ -100,6 +108,7 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
             }
             "-l" | "--list" => args.list = true,
             "-n" | "--dry-run" => args.dry_run = true,
+            "--json" => args.json = true,
             "-r" | "--refresh" => args.refresh = true,
             "--harness" => args.harness = Some(it.next().ok_or("--harness needs an id")?),
             "--provider" => args.provider = Some(it.next().ok_or("--provider needs an id")?),
@@ -122,12 +131,26 @@ fn real_main() -> Result<i32> {
         return Ok(0);
     };
 
+    // A JSON menu is not a thing, so the flag only means something once a mode that
+    // already prints rather than launches has been asked for.
+    if args.json && !args.list && !args.dry_run {
+        anyhow::bail!("--json describes a run rather than opening one: add --list or --dry-run");
+    }
+
     let cfg_path = match args.config.clone() {
         Some(p) => p,
         None => config::config_path().context("no config directory available on this system")?,
     };
 
     if config::ensure_config(&cfg_path)? {
+        // Under --json this is a failure, not a notice: the starter config declares
+        // example providers, and a caller has nothing to consume from them.
+        if args.json {
+            anyhow::bail!(
+                "a starter config was written at {}. Edit it, then ask again",
+                cfg_path.display()
+            );
+        }
         println!("fastpick wrote a starter config at {}", cfg_path.display());
         println!("Edit it, then run fastpick again. It ships one block per kind of harness");
         println!("and per kind of provider, each commented.");
@@ -137,7 +160,12 @@ fn real_main() -> Result<i32> {
     let cfg = config::Config::load(&cfg_path)?;
 
     if args.list {
-        print_list(&cfg, &args)?;
+        if args.json {
+            let listing = json::listing(&cfg, &cfg_path, args.provider.as_deref(), args.refresh)?;
+            json::print(&listing)?;
+        } else {
+            print_list(&cfg, &args)?;
+        }
         return Ok(0);
     }
 
@@ -220,7 +248,11 @@ fn real_main() -> Result<i32> {
     };
 
     if args.dry_run {
-        print_dry_run(&cfg, &sel)?;
+        if args.json {
+            json::print(&json::dry_run(&cfg, &sel)?)?;
+        } else {
+            print_dry_run(&cfg, &sel)?;
+        }
         return Ok(0);
     }
 
@@ -300,9 +332,16 @@ fn print_list(cfg: &config::Config, args: &Args) -> Result<()> {
     for h in &cfg.harnesses {
         println!("{}  [{}]  {}", h.name, h.id, h.bin);
         let mut group: Option<&str> = None;
-        for &pi in &cfg.providers_for(&h.id) {
+        for (row, &pi) in cfg.providers_for(&h.id).iter().enumerate() {
             let p = &cfg.providers[pi];
-            if p.group.as_deref() != group {
+            // Same rule as the menu: a change of group opens a block, separated by a blank
+            // line, and the heading is printed only when there is one. Without the blank
+            // line an ungrouped provider keeps the indentation of the block above it and
+            // reads as belonging to a heading that is not its own.
+            if p.group.as_deref() != group || row == 0 {
+                if row > 0 {
+                    println!();
+                }
                 if let Some(g) = p.group.as_deref() {
                     println!("  {g}");
                 }
