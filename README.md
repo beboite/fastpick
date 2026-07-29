@@ -7,7 +7,7 @@
   <a href="https://github.com/beboite/fastpick/stargazers"><img src="https://img.shields.io/github/stars/beboite/fastpick" alt="Stars" /></a>
   <a href="https://github.com/beboite/fastpick/issues"><img src="https://img.shields.io/github/issues/beboite/fastpick" alt="Issues" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6" alt="Platform" />
-  <img src="https://img.shields.io/badge/Rust-1.74%2B-CE422B?logo=rust" alt="Rust" />
+  <img src="https://img.shields.io/badge/Rust-1.78%2B-CE422B?logo=rust" alt="Rust" />
 </p>
 
 Every agent and every endpoint need slightly different setup, and shell wrappers duplicate

@@ -2,7 +2,7 @@
 name = "fastpick"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.78"
 description = "Terminal picker that chooses a coding harness, a provider and a model, then launches it with the right environment"
 license = "MIT"
 readme = "README.md"

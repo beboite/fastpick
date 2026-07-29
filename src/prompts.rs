@@ -42,7 +42,7 @@ pub fn all_in(dir: &Path) -> Vec<PromptFile> {
             })
         })
         .collect();
-    out.sort_by(|a, b| a.stem.to_lowercase().cmp(&b.stem.to_lowercase()));
+    out.sort_by_key(|p| p.stem.to_lowercase());
     out
 }
 

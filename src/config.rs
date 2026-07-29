@@ -551,11 +551,11 @@ fn create_dir_private(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        return std::fs::DirBuilder::new()
+        std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)
-            .with_context(|| format!("creating {}", dir.display()));
+            .with_context(|| format!("creating {}", dir.display()))
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))

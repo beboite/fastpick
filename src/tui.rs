@@ -616,11 +616,9 @@ fn event_loop(
                 KeyCode::Down | KeyCode::Char('j') => {
                     app.provider_row = next(app.provider_row, app.provider_rows.len())
                 }
-                KeyCode::Enter | KeyCode::Right => {
-                    if app.provider().is_some() {
-                        app.set_screen(Screen::Model);
-                        app.load_models(false);
-                    }
+                KeyCode::Enter | KeyCode::Right if app.provider().is_some() => {
+                    app.set_screen(Screen::Model);
+                    app.load_models(false);
                 }
                 _ => {}
             },

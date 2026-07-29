@@ -21,6 +21,7 @@ pub enum Access {
     /// Windows, where there are no mode bits to read: the file inherits the ACL of the
     /// user profile it sits under, which is the same protection the agent's own credentials
     /// get. Claiming more than that would be a lie.
+    #[cfg_attr(unix, allow(dead_code))]
     Unchecked,
 }
 
