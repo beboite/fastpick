@@ -13,6 +13,7 @@ mod paths;
 mod prompts;
 mod state;
 mod tui;
+mod update;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -36,6 +37,7 @@ OPTIONS
       --md <file>        system prompt file, repeatable. A bare name is resolved inside the
                          prompts folder; anything else is taken as a path
       --no-md            launch without a system prompt even if one matches the model
+  -u, --update           install the newest signed release over this binary
   -h, --help             this text
   -V, --version          version
 
@@ -79,6 +81,7 @@ struct Args {
     effort: Option<String>,
     md: Vec<String>,
     no_md: bool,
+    update: bool,
     passthrough: Vec<String>,
 }
 
@@ -107,6 +110,7 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
             "--effort" => args.effort = Some(it.next().ok_or("--effort needs a level")?),
             "--md" => args.md.push(it.next().ok_or("--md needs a file")?),
             "--no-md" => args.no_md = true,
+            "-u" | "--update" => args.update = true,
             "--" => {
                 args.passthrough.extend(it);
                 break;
@@ -131,7 +135,7 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
 /// Everything else is forwarded, because forwarding is the documented behaviour that makes
 /// `fastpick -p "hello"` work. Only a one-character slip on a known name is refused.
 fn looks_like_a_typo(a: &str) -> bool {
-    const KNOWN: [&str; 9] = [
+    const KNOWN: [&str; 10] = [
         "--config",
         "--list",
         "--dry-run",
@@ -141,6 +145,7 @@ fn looks_like_a_typo(a: &str) -> bool {
         "--model",
         "--effort",
         "--no-md",
+        "--update",
     ];
     let Some(name) = a.split('=').next() else {
         return false;
@@ -197,6 +202,15 @@ fn real_main() -> Result<i32> {
     let Some(args) = parse_args().map_err(anyhow::Error::msg)? else {
         return Ok(0);
     };
+
+    // Whatever the last `--update` could not delete while it was running.
+    update::sweep_leftovers();
+
+    // Before the config: updating is the one thing that has to work on a machine whose
+    // config is broken, and it is often what fixes it.
+    if args.update {
+        return update::run();
+    }
 
     let cfg_path = match args.config.clone() {
         Some(p) => p,

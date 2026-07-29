@@ -15,6 +15,7 @@ fastpick --harness opencode                     # skip the first screen
 fastpick --harness codex --provider acme --model acme-large        # no menu at all
 fastpick --list --provider acme                 # what that provider serves right now
 fastpick --dry-run                              # the exact command and environment
+fastpick --update                               # install the newest signed release
 ```
 
 Each of `--harness`, `--provider` and `--model` skips its own screen. The menu opens on the
@@ -165,6 +166,20 @@ you pick the agent's own login. A catalogue url on `http://` is refused outright
 is loopback or `auth = "none"`, and model ids from a provider are checked against a plain
 allowlist before they can reach a command line.
 
+## Updating
+
+Every release ships one signed binary per platform. `fastpick --update` fetches the newest
+one, checks its minisign signature against the key compiled into the running binary, and
+only then puts it in place. A signature that does not match, or a release that ships no
+`.minisig` at all, stops the update rather than prompting.
+
+The menu checks for a newer version at most once a day, on a background thread, and the
+answer is cached on disk. Nothing installs itself: the only effect is a line at the bottom
+of the screen naming the version and the command. A launch that names the harness, the
+provider and the model on the command line never checks at all, because that is a script.
+
+Set `GH_TOKEN` if the repository is private.
+
 ## Build
 
 ```
@@ -173,6 +188,33 @@ cargo test
 ```
 
 The binary is self-contained. Drop it anywhere on your PATH.
+
+## Releasing
+
+The version lives in `Cargo.toml` and the tag has to agree with it, which the workflow
+checks before building anything.
+
+```
+cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test
+git tag -a v0.3.0 -m "v0.3.0"
+git push origin v0.3.0
+```
+
+The tag builds five targets, signs each binary with the key in the `MINISIGN_SECRET_KEY`
+repository secret, writes `SHA256SUMS.txt` and opens a **draft** release. Nothing reaches
+anyone until that draft is published by hand: `--update` reads `releases/latest`, which
+skips drafts.
+
+The signing key is generated once, outside the repository:
+
+```
+minisign -G -p fastpick.pub -s fastpick.key
+```
+
+Then the second line of `fastpick.pub` goes into `PUBLIC_KEY` in `src/update.rs`, and
+`fastpick.key` goes into the `MINISIGN_SECRET_KEY` secret with its password in
+`MINISIGN_PASSWORD`. Until `PUBLIC_KEY` is filled in, `--update` refuses to install
+anything and says so, which is the right way round for an empty key.
 
 ## License
 

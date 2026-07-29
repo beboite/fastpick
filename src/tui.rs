@@ -91,6 +91,11 @@ pub struct App<'a> {
     /// Carried here rather than printed: anything written to the terminal before
     /// `ratatui::init()` is wiped by the switch to the alternate screen a moment later.
     notice: Option<String>,
+
+    /// A newer release, if the last check found one. Read once here rather than per frame,
+    /// which also means a check that lands during this run shows up on the next one. That
+    /// is the right side to err on for a line nobody asked for.
+    update_available: Option<String>,
 }
 
 impl<'a> App<'a> {
@@ -122,6 +127,7 @@ impl<'a> App<'a> {
             opt_row: 0,
             unsupported: Vec::new(),
             notice: None,
+            update_available: crate::update::pending(),
         };
         app.rebuild_providers();
         if let Some(pi) = start.provider_idx {
@@ -443,6 +449,11 @@ pub fn run(cfg: &Config, start: &Start) -> Result<Option<Picked>> {
         }
     }
 
+    // Only now, once it is certain a menu will be drawn. A launch that named all three
+    // steps on the command line is a script, and a script does not want a request to
+    // github.com it never asked for.
+    crate::update::check_in_background();
+
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app, pending_model.as_deref());
     ratatui::restore();
@@ -668,8 +679,9 @@ fn draw(f: &mut Frame, app: &App) {
         Body::Rows(rows, _) => rows.len() as u16,
         Body::Text(t) => wrapped_height(t, area.width),
     };
-    // title, blank, body, blank, status, help.
-    let room = area.height.saturating_sub(5).max(1);
+    // title, blank, body, blank, status, help, and the update line when there is one.
+    let footer_height = if app.update_available.is_some() { 3 } else { 2 };
+    let room = area.height.saturating_sub(3 + footer_height as u16).max(1);
     let height = wanted.clamp(1, room);
 
     f.render_widget(
@@ -697,23 +709,30 @@ fn draw(f: &mut Frame, app: &App) {
 
     let footer = Rect {
         y: body_area.y + height + 1,
-        height: 2,
+        height: footer_height as u16,
         ..area
     };
     if footer.y + footer.height <= area.y + area.height {
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    status(app),
-                    Style::new().fg(match &app.source {
-                        Some(Source::Failed(_)) => Color::Yellow,
-                        _ => Color::DarkGray,
-                    }),
-                )),
-                Line::from(Span::styled(help(app), Style::new().fg(Color::DarkGray))),
-            ]),
-            footer,
-        );
+        let mut lines = vec![
+            Line::from(Span::styled(
+                status(app),
+                Style::new().fg(match &app.source {
+                    Some(Source::Failed(_)) => Color::Yellow,
+                    _ => Color::DarkGray,
+                }),
+            )),
+            Line::from(Span::styled(help(app), Style::new().fg(Color::DarkGray))),
+        ];
+        if let Some(v) = &app.update_available {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} · {v} available, run `fastpick --update`",
+                    crate::update::current_version()
+                ),
+                Style::new().fg(Color::DarkGray),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), footer);
     }
 }
 
