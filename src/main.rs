@@ -1,5 +1,5 @@
-//! fastpick: pick a coding harness, a provider and a model, then launch that agent with the
-//! environment the combination needs.
+//! fastpick: pick a coding harness (Claude Code, Codex, OpenCode), a provider and a model,
+//! then launch that agent with the environment the combination needs.
 //!
 //! The menu asks in that order because that is the order the answers constrain each other:
 //! a harness can only reach the providers wired to it, and a provider only serves the

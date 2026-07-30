@@ -1,5 +1,5 @@
 <h1 align="center">fastpick</h1>
-<p align="center">Terminal picker that runs before your coding agent: harness, provider, model, system prompts, launch.</p>
+<p align="center">Terminal picker for Claude Code, Codex and OpenCode: harness, provider, model, system prompts, launch.</p>
 
 <p align="center">
   <a href="https://github.com/beboite/fastpick/releases"><img src="https://img.shields.io/github/v/release/beboite/fastpick?display_name=tag" alt="Release" /></a>
@@ -11,9 +11,9 @@
   <img src="https://img.shields.io/badge/Rust-1.88%2B-CE422B?logo=rust" alt="Rust" />
 </p>
 
-Every agent and every endpoint need slightly different setup, and shell wrappers duplicate
-that setup once per pair. Here it is one config file, and the model list is not config at
-all: it is fetched from the provider.
+Claude Code, Codex and OpenCode each want a different environment, and so does every
+endpoint you point them at, so shell wrappers duplicate that setup once per pair. Here it is
+one config file, and the model list is not config at all: it is fetched from the provider.
 
 ## Install
 

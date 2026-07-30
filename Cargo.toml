@@ -1,14 +1,14 @@
 [package]
 name = "fastpick"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.88"
-description = "Terminal picker that chooses a coding harness, a provider and a model, then launches it with the right environment"
+description = "Terminal picker for Claude Code, Codex and OpenCode: choose the harness, the provider and the model, then launch it with the environment that combination needs"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/beboite/fastpick"
-homepage = "https://github.com/beboite/fastpick"
-keywords = ["cli", "tui", "llm", "launcher", "picker"]
+homepage = "https://crates.io/crates/fastpick"
+keywords = ["claude-code", "codex", "opencode", "coding-agent", "launcher"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
