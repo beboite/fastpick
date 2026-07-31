@@ -343,12 +343,39 @@ impl<'a> App<'a> {
 
     /// Selects a model by id without going through the list, for `--model`.
     ///
-    /// Reports failure when the id is not on screen, rather than falling back to the first
-    /// row. `unwrap_or(0)` here used to answer "selected" while pointing at a different
-    /// model, so `--model x` could launch y with nothing said about it.
-    pub fn select_model_id(&mut self, id: &str) -> bool {
-        let Some(i) = self.models.iter().position(|l| l.model.id == id) else {
-            return false;
+    /// `Ok(false)` when the id is not on screen, rather than falling back to the first row.
+    /// `unwrap_or(0)` here used to answer "selected" while pointing at a different model, so
+    /// `--model x` could launch y with nothing said about it.
+    ///
+    /// `Err` when the id is on screen more than once. Two keys of one site serving a model of
+    /// the same name is ordinary: two subscriptions, two price lists, one name. Which one to
+    /// spend is a question, and `position()` answered it by taking whichever key the config
+    /// happened to declare first.
+    pub fn select_model_id(&mut self, id: &str) -> std::result::Result<bool, String> {
+        let hits: Vec<usize> = self
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.model.id == id)
+            .map(|(i, _)| i)
+            .collect();
+        if hits.len() > 1 {
+            let names: Vec<String> = match self.provider() {
+                Some(p) => hits
+                    .iter()
+                    .filter_map(|&i| self.models.get(i))
+                    .map(|l| format!("--key {}", p.route_id(l.key)))
+                    .collect(),
+                None => Vec::new(),
+            };
+            return Err(format!(
+                "`{id}` is served by {} of this provider's keys, so name the one to use: {}",
+                hits.len(),
+                names.join(", ")
+            ));
+        }
+        let Some(i) = hits.first().copied() else {
+            return Ok(false);
         };
         // A filter left over from an earlier screen can hide a model that does exist. The
         // named one wins over the filter, and the cursor has to land on that exact row: the
@@ -361,12 +388,12 @@ impl<'a> App<'a> {
         match self.visible_models.iter().position(|&v| v == i) {
             Some(row) => {
                 self.model_idx = row;
-                true
+                Ok(true)
             }
             // Unreachable with the filter cleared, and answered with `false` rather than
             // row 0 anyway: the caller treats that as "not found" and opens the screen,
             // where landing on someone else's row would silently swap the credential.
-            None => false,
+            None => Ok(false),
         }
     }
 
@@ -553,9 +580,18 @@ pub fn run(cfg: &Config, start: &Start) -> Result<Option<Picked>> {
                 std::thread::sleep(Duration::from_millis(20));
             }
             pending_model = None;
-            if !app.loading() && app.select_model_id(&id) {
-                app.enter_options();
-                return Ok(app.picked());
+            if !app.loading() {
+                match app.select_model_id(&id) {
+                    Ok(true) => {
+                        app.enter_options();
+                        return Ok(app.picked());
+                    }
+                    // Real name, named too loosely. Everything on this path was answered on
+                    // the command line, so it is a script, and a script gets the reason and
+                    // a non-zero exit rather than a menu nobody is there to answer.
+                    Err(e) => anyhow::bail!(e),
+                    Ok(false) => {}
+                }
             }
             // Unknown id, or the catalogue never answered. Rather than launching something
             // else, open the list with the name already in the filter so the near misses
@@ -597,15 +633,22 @@ fn event_loop(
         if let Some(id) = pending_model.clone() {
             if app.screen == Screen::Model && !app.loading() {
                 pending_model = None;
-                if app.select_model_id(&id) {
-                    app.enter_options();
-                    return Ok(app.picked());
+                match app.select_model_id(&id) {
+                    Ok(true) => {
+                        app.enter_options();
+                        return Ok(app.picked());
+                    }
+                    // Unknown id: fall back to the list rather than launching something
+                    // else. The filter is pre-filled so the near misses are on screen.
+                    // Ambiguous is the same fallback with a different reason: the menu is
+                    // already open, and picking a row is exactly the answer it wants.
+                    Ok(false) => {
+                        app.notice = Some(format!(
+                            "`{id}` is not in this provider's catalogue, pick from the list"
+                        ));
+                    }
+                    Err(e) => app.notice = Some(e),
                 }
-                // Unknown id: fall back to the list rather than launching something else.
-                // The filter is pre-filled so the near misses are already on screen.
-                app.notice = Some(format!(
-                    "`{id}` is not in this provider's catalogue, pick from the list"
-                ));
                 app.filter = id;
                 app.rebuild_models();
             }
@@ -1730,6 +1773,48 @@ mod tests {
             .map(|l| l.key)
             .collect();
         assert_eq!(shared, vec![0, 1]);
+    }
+
+    /// One name, two subscriptions. Answering it by taking the first key would launch on a
+    /// billing account the command line never named.
+    #[test]
+    fn a_model_id_two_keys_both_serve_is_refused_with_the_keys_named() {
+        let cfg = two_keys();
+        let mut app = App::new(&cfg, &Start::default());
+        app.set_screen(Screen::Model);
+        app.load_models(false);
+        settle(&mut app);
+
+        let err = app.select_model_id("shared").unwrap_err();
+        assert!(err.contains("--key site.openai"), "{err}");
+        assert!(err.contains("--key site.anthropic"), "{err}");
+
+        // A name only one key serves is still answered, and the row keeps that key.
+        assert_eq!(app.select_model_id("gpt-5"), Ok(true));
+        assert_eq!(app.picked().unwrap().key, 0);
+        assert_eq!(app.select_model_id("nothing-like-it"), Ok(false));
+    }
+
+    /// With --key there is only one candidate left, so the same id resolves.
+    #[test]
+    fn naming_the_key_makes_a_shared_model_id_answerable_again() {
+        let cfg = two_keys();
+        let start = Start {
+            provider_idx: Some(0),
+            key: Some(1),
+            skip_harness: true,
+            skip_provider: true,
+            ..Start::default()
+        };
+        let mut app = App::new(&cfg, &start);
+        app.set_screen(Screen::Model);
+        app.load_models(false);
+        settle(&mut app);
+
+        assert_eq!(app.select_model_id("shared"), Ok(true));
+        assert_eq!(app.picked().unwrap().key, 1);
+        // The other key's own models went with it.
+        assert_eq!(app.select_model_id("gpt-5"), Ok(false));
     }
 
     #[test]
