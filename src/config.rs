@@ -635,6 +635,28 @@ impl Config {
                 ));
             }
         }
+
+        // Route ids share one namespace even though they are built two different ways, and
+        // `route()` answers with the first provider whose id matches. So a provider literally
+        // named `site.openai` hides key `openai` of a provider named `site`: both are spelled
+        // the same, and the hidden one is unreachable from --key and --set-key with nothing
+        // said about it. Checked after the per-key rules, so a dot in a key id is reported as
+        // itself rather than as the collision it causes.
+        let mut routes: BTreeMap<String, String> = BTreeMap::new();
+        for p in &self.providers {
+            for ki in 0..p.keys.len() {
+                let whose = match p.keys.len() > 1 {
+                    true => format!("key `{}` of provider `{}`", p.keys[ki].id, p.id),
+                    false => format!("provider `{}`", p.id),
+                };
+                if let Some(first) = routes.insert(p.route_id(ki), whose.clone()) {
+                    return Err(anyhow!(
+                        "`{}` names both {first} and {whose}, so only the first can be reached from --key and --set-key. Rename one of them.",
+                        p.route_id(ki)
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1229,6 +1251,95 @@ mod key_tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("no harness can reach it"), "{err}");
+    }
+
+    /// Two ways of building a route id land in one namespace, and `route()` cannot tell the
+    /// spellings apart. Caught at load, because the loser is simply missing afterwards.
+    #[test]
+    fn a_provider_named_like_a_route_and_the_route_itself_cannot_both_exist() {
+        let err = parse(
+            r#"
+            [[provider]]
+            id = "site.openai"
+            name = "Impostor"
+
+            [provider.harness.claude-code]
+            base_url = "https://impostor.invalid"
+
+            [[provider.model]]
+            id = "m"
+
+            [[provider]]
+            id = "site"
+            name = "Site"
+
+            [[provider.key]]
+            id = "openai"
+            [provider.key.harness.claude-code]
+            base_url = "https://site.invalid"
+            [[provider.key.model]]
+            id = "a"
+
+            [[provider.key]]
+            id = "xai"
+            [provider.key.harness.claude-code]
+            base_url = "https://site.invalid"
+            [[provider.key.model]]
+            id = "b"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`site.openai` names both"), "{err}");
+        assert!(err.contains("Rename one of them"), "{err}");
+    }
+
+    /// The check has to look at the ids routes actually answer to, not at the halves they
+    /// are built from. Two providers each holding a key called `openai` collide on nothing.
+    #[test]
+    fn the_same_key_id_under_two_providers_is_two_different_routes() {
+        let cfg = parse(
+            r#"
+            [[provider]]
+            id = "one"
+            name = "One"
+
+            [[provider.key]]
+            id = "openai"
+            [provider.key.harness.claude-code]
+            base_url = "https://one.invalid"
+            [[provider.key.model]]
+            id = "a"
+
+            [[provider.key]]
+            id = "xai"
+            [provider.key.harness.claude-code]
+            base_url = "https://one.invalid"
+            [[provider.key.model]]
+            id = "b"
+
+            [[provider]]
+            id = "two"
+            name = "Two"
+
+            [[provider.key]]
+            id = "openai"
+            [provider.key.harness.claude-code]
+            base_url = "https://two.invalid"
+            [[provider.key.model]]
+            id = "c"
+
+            [[provider.key]]
+            id = "xai"
+            [provider.key.harness.claude-code]
+            base_url = "https://two.invalid"
+            [[provider.key.model]]
+            id = "d"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.route("one.openai"), Some((0, 0)));
+        assert_eq!(cfg.route("two.openai"), Some((1, 0)));
     }
 
     #[test]
