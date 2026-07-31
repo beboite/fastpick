@@ -46,6 +46,9 @@ pub struct Picked {
 pub struct Start {
     pub harness_idx: Option<usize>,
     pub provider_idx: Option<usize>,
+    /// Index of the key `--key` named, inside `provider_idx`. Narrows the model list to that
+    /// one credential, so a model two keys both serve resolves without a guess.
+    pub key: Option<usize>,
     pub model_id: Option<String>,
     pub skip_harness: bool,
     pub skip_provider: bool,
@@ -68,6 +71,10 @@ pub struct App<'a> {
     /// How many models each of those serves, when that is known without a fetch. Computed
     /// once per harness switch rather than per frame: it reads files.
     provider_counts: Vec<Option<usize>>,
+
+    /// The provider and key `--key` named, while the user is still on that provider. Moving
+    /// to another one is a new question and its keys were never the ones filtered out.
+    only_key: Option<(usize, usize)>,
 
     /// Every key's models in one list, each row remembering the key that listed it.
     models: Vec<Listed>,
@@ -134,6 +141,7 @@ impl<'a> App<'a> {
             provider_rows: Vec::new(),
             provider_row: 0,
             provider_counts: Vec::new(),
+            only_key: start.provider_idx.zip(start.key),
             models: Vec::new(),
             source: None,
             rx: None,
@@ -237,12 +245,19 @@ impl<'a> App<'a> {
         let Some(p) = self.provider() else { return };
         // One lookup per key that can serve this harness. A key answers for what it may use,
         // so asking the provider once would list models half the credentials cannot reach.
-        let reqs = catalog::requests_for(
+        let mut reqs = catalog::requests_for(
             self.cfg,
             p,
             Some(&self.harness().id),
             force || self.force_refresh,
         );
+        // `--key` was an answer to "which credential", so the other keys of that site are not
+        // fetched at all: no lookup, no cache write, nothing on screen to pick by mistake.
+        if let Some((pi, ki)) = self.only_key {
+            if self.provider_idx() == Some(pi) {
+                reqs.retain(|r| r.key_idx == ki);
+            }
+        }
         self.force_refresh = false;
         self.models.clear();
         self.visible_models.clear();
@@ -1623,6 +1638,98 @@ mod tests {
         assert_eq!(only.model.id, "claude-opus-5");
         assert_eq!(only.key, 1);
         assert!(render(&app).contains("anthropic"));
+    }
+
+    /// A provider with two keys and no catalogue anywhere, so `load_models` answers from the
+    /// config alone and the test never reaches a network.
+    fn two_keys() -> Config {
+        Config::parse(
+            r#"
+            [[harness]]
+            id = "claude-code"
+            name = "Claude Code"
+            kind = "claude-code"
+            bin = "claude"
+
+            [[provider]]
+            id = "site"
+            name = "Site"
+
+            [[provider.key]]
+            id = "openai"
+            [provider.key.harness.claude-code]
+            base_url = "https://site.invalid"
+            [[provider.key.model]]
+            id = "gpt-5"
+            [[provider.key.model]]
+            id = "shared"
+
+            [[provider.key]]
+            id = "anthropic"
+            [provider.key.harness.claude-code]
+            base_url = "https://site.invalid"
+            [[provider.key.model]]
+            id = "claude-opus-5"
+            [[provider.key.model]]
+            id = "shared"
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// Drains a fetch that answers from the config, so `models` is settled before it is read.
+    fn settle(app: &mut App) {
+        for _ in 0..500 {
+            app.poll_models();
+            if !app.loading() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the config-only lookup never landed");
+    }
+
+    /// `--key` was an answer to "which credential", so the other key is not fetched at all.
+    /// Leaving its models on screen would let the next keypress pick one.
+    #[test]
+    fn a_named_key_is_the_only_one_that_lists_anything() {
+        let cfg = two_keys();
+        let start = Start {
+            provider_idx: Some(0),
+            key: Some(1),
+            skip_harness: true,
+            skip_provider: true,
+            ..Start::default()
+        };
+        let mut app = App::new(&cfg, &start);
+        app.set_screen(Screen::Model);
+        app.load_models(false);
+        settle(&mut app);
+
+        assert!(
+            app.models.iter().all(|l| l.key == 1),
+            "a key nobody asked for listed something"
+        );
+        let ids: Vec<&str> = app.models.iter().map(|l| l.model.id.as_str()).collect();
+        assert_eq!(ids, vec!["claude-opus-5", "shared"]);
+    }
+
+    /// Without the flag both keys list, `shared` appears twice, and each row keeps its own.
+    #[test]
+    fn without_the_flag_every_key_lists_and_a_shared_id_appears_once_per_key() {
+        let cfg = two_keys();
+        let mut app = App::new(&cfg, &Start::default());
+        app.set_screen(Screen::Model);
+        app.load_models(false);
+        settle(&mut app);
+
+        let shared: Vec<usize> = app
+            .models
+            .iter()
+            .filter(|l| l.model.id == "shared")
+            .map(|l| l.key)
+            .collect();
+        assert_eq!(shared, vec![0, 1]);
     }
 
     #[test]
