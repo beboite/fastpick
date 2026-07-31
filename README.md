@@ -32,6 +32,7 @@ fastpick                                     # menu
 fastpick -p "hello"                          # menu, then those arguments go to the agent
 fastpick --harness opencode                  # skip the first screen
 fastpick --harness codex --provider acme --model acme-large    # no menu at all
+fastpick --key acme.openai                   # one credential of a site holding several
 fastpick --list --provider acme              # what that provider serves right now
 fastpick --list --json                       # the same, for another program
 fastpick --dry-run                           # the exact command and environment
@@ -39,7 +40,8 @@ fastpick --update                            # install the newest signed release
 ```
 
 Each of `--harness`, `--provider` and `--model` skips its own screen; the menu opens on the
-first one you left out.
+first one you left out. `--key` names a credential, which names its provider too, so it
+skips that screen as well.
 
 Up and down move, right goes forward, left goes back. On the model list Enter launches
 straight away: the matching system prompt file is already checked and the effort is the
@@ -121,7 +123,9 @@ resolves the key, which is what keeps the endpoint and the token from coming out
 different blocks, and a proxy declared on one key never starts for a launch on another. Each
 key is asked its own catalogue, in parallel, and cached separately. On the command line a key
 is `<provider>.<key>`, so `fastpick --set-key acme.openai` writes one credential and
-`fastpick --set-key acme` errors and lists what it could have meant. A provider holding a
+`fastpick --set-key acme` errors and lists what it could have meant. `--key` reads the same
+id and narrows the model list to that one credential, which is also how `--model` stays
+unambiguous when two keys of a site serve a model of the same name. A provider holding a
 single key keeps answering to its own id everywhere, and the short form above stays valid.
 
 ## Harnesses

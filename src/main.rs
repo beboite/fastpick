@@ -40,6 +40,9 @@ OPTIONS
   -r, --refresh          refetch the model catalogue instead of using the cached one
       --harness <id>     skip the harness screen
       --provider <id>    skip the provider screen
+      --key <id>         use one credential of a provider that holds several, written
+                         <provider>.<key>. Names the provider too, so --provider is
+                         redundant with it
       --model <id>       skip the model screen
       --effort <level>   effort level, when the harness takes one
       --md <file>        system prompt file, repeatable. A bare name is resolved inside the
@@ -50,7 +53,9 @@ OPTIONS
   -V, --version          version
 
 Each of --harness, --provider and --model skips its own screen; the menu opens on the
-first one you left out. Anything not recognised is forwarded to the agent, so
+first one you left out. --key narrows the model list to one credential, which is what
+makes --model unambiguous when two keys of a site serve a model of the same name.
+Anything not recognised is forwarded to the agent, so
 `fastpick -p \"hello\"` works. Use `--` when an argument would otherwise be read as a
 fastpick option.
 
@@ -99,6 +104,7 @@ struct Args {
     refresh: bool,
     harness: Option<String>,
     provider: Option<String>,
+    key: Option<String>,
     model: Option<String>,
     effort: Option<String>,
     md: Vec<String>,
@@ -132,6 +138,7 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
             "-r" | "--refresh" => args.refresh = true,
             "--harness" => args.harness = Some(it.next().ok_or("--harness needs an id")?),
             "--provider" => args.provider = Some(it.next().ok_or("--provider needs an id")?),
+            "--key" => args.key = Some(it.next().ok_or("--key needs an id")?),
             "--model" => args.model = Some(it.next().ok_or("--model needs an id")?),
             "--effort" => args.effort = Some(it.next().ok_or("--effort needs a level")?),
             "--md" => args.md.push(it.next().ok_or("--md needs a file")?),
@@ -161,13 +168,14 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
 /// Everything else is forwarded, because forwarding is the documented behaviour that makes
 /// `fastpick -p "hello"` work. Only a one-character slip on a known name is refused.
 fn looks_like_a_typo(a: &str) -> bool {
-    const KNOWN: [&str; 10] = [
+    const KNOWN: [&str; 11] = [
         "--config",
         "--list",
         "--dry-run",
         "--refresh",
         "--harness",
         "--provider",
+        "--key",
         "--model",
         "--effort",
         "--no-md",
@@ -293,6 +301,19 @@ fn real_main() -> Result<i32> {
             anyhow::bail!("no provider with id `{id}`, see --list");
         }
     }
+    // `--key` names a credential, and a credential belongs to exactly one provider, so it
+    // answers the provider screen too. Resolved here so a typo is refused before --list
+    // prints a catalogue that would look like the flag had been honoured.
+    let keyed = match &args.key {
+        Some(id) => Some(resolve_route(&cfg, id)?),
+        None => None,
+    };
+    if let (Some((pi, _)), Some(id)) = (keyed, &args.provider) {
+        let owner = &cfg.providers[pi].id;
+        if owner != id {
+            anyhow::bail!("--key names a key of provider `{owner}`, but --provider names `{id}`");
+        }
+    }
 
     if args.list {
         if args.json {
@@ -328,8 +349,9 @@ fn real_main() -> Result<i32> {
             .and_then(|id| cfg.harnesses.iter().position(|h| &h.id == id)),
     };
 
-    let provider_idx = match &args.provider {
-        Some(id) => {
+    let provider_idx = match (keyed, &args.provider) {
+        (Some((pi, _)), _) => Some(pi),
+        (None, Some(id)) => {
             let idx = cfg
                 .providers
                 .iter()
@@ -346,20 +368,35 @@ fn real_main() -> Result<i32> {
             }
             Some(idx)
         }
-        None => saved
+        (None, None) => saved
             .last_provider
             .as_ref()
             .and_then(|id| cfg.providers.iter().position(|p| &p.id == id)),
     };
 
+    // Narrower than the provider check above: a site can bind a harness on one key and not
+    // on the next, so a named key has to answer for itself. Otherwise the pair reaches the
+    // model screen and shows an empty list with no reason given.
+    if let (Some((pi, ki)), Some(h)) = (keyed, harness_idx) {
+        let harness = &cfg.harnesses[h];
+        if cfg.providers[pi].keys[ki].binding(&harness.id).is_none() {
+            anyhow::bail!(
+                "key `{}` declares no binding for harness `{}`, so that pair cannot be launched",
+                cfg.providers[pi].route_id(ki),
+                harness.id
+            );
+        }
+    }
+
     let start = tui::Start {
         harness_idx,
         provider_idx,
+        key: keyed.map(|(_, ki)| ki),
         // Named on the command line only. A remembered model is deliberately not applied:
         // it would launch on a model the user never confirmed for this provider.
         model_id: args.model.clone(),
         skip_harness: args.harness.is_some(),
-        skip_provider: args.provider.is_some(),
+        skip_provider: args.provider.is_some() || args.key.is_some(),
         refresh: args.refresh,
     };
 
@@ -579,24 +616,30 @@ fn print_paths(cfg: &config::Config, cfg_path: &Path) {
     }
 }
 
-/// Writes one key, read from stdin so it never reaches a shell history.
+/// Turns a route id into the provider and key it names, or says what it could have meant.
 ///
-/// The argument is a route id: `crof` for a provider holding one credential,
-/// `codex-everywhere.openai` for one of several. A bare id on a provider holding several is
-/// refused rather than guessed at, because writing a subscription over the wrong file is
-/// silent until the next launch fails.
+/// `crof` for a provider holding one credential, `codex-everywhere.openai` for one of
+/// several. A bare id on a provider holding several is refused rather than defaulted to the
+/// first: both --set-key and --key act on a subscription, and picking the wrong one is
+/// silent until a key file is overwritten or a launch bills the other account.
+fn resolve_route(cfg: &config::Config, id: &str) -> Result<(usize, usize)> {
+    if let Some(route) = cfg.route(id) {
+        return Ok(route);
+    }
+    if let Some(p) = cfg.providers.iter().find(|p| p.id == id) {
+        let names: Vec<String> = p.keys.iter().map(|k| format!("{id}.{}", k.id)).collect();
+        anyhow::bail!(
+            "provider `{id}` holds {} keys, so name the one you mean: {}",
+            p.keys.len(),
+            names.join(", ")
+        );
+    }
+    anyhow::bail!("no provider or key with id `{id}`, see --list");
+}
+
+/// Writes one key, read from stdin so it never reaches a shell history.
 fn set_key(cfg: &config::Config, id: &str) -> Result<i32> {
-    let Some((pi, ki)) = cfg.route(id) else {
-        if let Some(p) = cfg.providers.iter().find(|p| p.id == id) {
-            let names: Vec<String> = p.keys.iter().map(|k| format!("{id}.{}", k.id)).collect();
-            anyhow::bail!(
-                "provider `{id}` holds {} keys, so name the one to write: {}",
-                p.keys.len(),
-                names.join(", ")
-            );
-        }
-        anyhow::bail!("no provider or key with id `{id}`, see --list");
-    };
+    let (pi, ki) = resolve_route(cfg, id)?;
     let p = &cfg.providers[pi];
     let k = &p.keys[ki];
 
@@ -788,6 +831,66 @@ mod tests {
         assert!(!is_secret_env("CLAUDE_CODE_AUTO_COMPACT_WINDOW"));
         assert!(!is_secret_env("ANTHROPIC_BASE_URL"));
         assert!(!is_secret_env("ANTHROPIC_SMALL_FAST_MODEL"));
+    }
+
+    /// Both --key and --set-key act on one subscription, so a bare id that could mean two of
+    /// them is refused with the candidates named. Defaulting to the first is silent until a
+    /// key file is overwritten or a launch bills the other account.
+    #[test]
+    fn a_bare_provider_id_resolves_only_while_it_holds_one_key() {
+        let cfg = config::Config::parse(
+            r#"
+            [[harness]]
+            id = "claude-code"
+            name = "Claude Code"
+            kind = "claude-code"
+            bin = "claude"
+
+            [[provider]]
+            id = "solo"
+            name = "Solo"
+            [provider.harness.claude-code]
+            base_url = "https://solo.invalid"
+            [[provider.model]]
+            id = "m"
+
+            [[provider]]
+            id = "site"
+            name = "Site"
+
+            [[provider.key]]
+            id = "openai"
+            [provider.key.harness.claude-code]
+            base_url = "https://site.invalid"
+            [[provider.key.model]]
+            id = "a"
+
+            [[provider.key]]
+            id = "xai"
+            [provider.key.harness.claude-code]
+            base_url = "https://site.invalid"
+            [[provider.key.model]]
+            id = "b"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(resolve_route(&cfg, "solo").unwrap(), (0, 0));
+        assert_eq!(resolve_route(&cfg, "site.xai").unwrap(), (1, 1));
+
+        let err = resolve_route(&cfg, "site").unwrap_err().to_string();
+        assert!(err.contains("site.openai"), "{err}");
+        assert!(err.contains("site.xai"), "{err}");
+
+        // The short form folds into a key named after its provider, so `solo.solo` is the
+        // same route spelled the long way. Accepted rather than refused: it is what a script
+        // that builds the id from two fields writes, and it can mean nothing else.
+        assert_eq!(resolve_route(&cfg, "solo.solo").unwrap(), (0, 0));
+
+        for unknown in ["nope", "site.nope", "site.site", "solo.openai"] {
+            let err = resolve_route(&cfg, unknown).unwrap_err().to_string();
+            assert!(err.contains("no provider or key"), "{unknown}: {err}");
+        }
     }
 
     #[test]
