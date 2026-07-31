@@ -70,7 +70,7 @@ pub struct App<'a> {
     provider_row: usize,
     /// How many models each of those serves, when that is known without a fetch. Computed
     /// once per harness switch rather than per frame: it reads files.
-    provider_counts: Vec<Option<usize>>,
+    provider_counts: Vec<Option<catalog::Count>>,
 
     /// The provider and key `--key` named, while the user is still on that provider. Moving
     /// to another one is a new question and its keys were never the ones filtered out.
@@ -1134,6 +1134,16 @@ fn count(n: usize, thing: &str) -> String {
     }
 }
 
+/// The model count for a provider row. `at least` when one of the site's keys has never been
+/// fetched: the number is real and the list is longer, and neither half of that can be left
+/// out without the row saying something untrue.
+fn model_count(c: catalog::Count) -> String {
+    match c.floor {
+        false => count(c.total, "model"),
+        true => format!("   at least {}", count(c.total, "model").trim_start()),
+    }
+}
+
 fn harness_body(app: &App) -> Body {
     // Only what is installed is offered. A menu whose entries mostly fail is worse than a
     // short one, so a declared harness with no binary is left out rather than greyed.
@@ -1196,11 +1206,8 @@ fn provider_body(app: &App) -> Body {
         }
 
         let mut spans = vec![Span::raw(p.name.clone())];
-        if let Some(n) = app.provider_counts.get(row).copied().flatten() {
-            spans.push(Span::styled(
-                count(n, "model"),
-                Style::new().fg(Color::Blue),
-            ));
+        if let Some(c) = app.provider_counts.get(row).copied().flatten() {
+            spans.push(Span::styled(model_count(c), Style::new().fg(Color::Blue)));
         }
         rows.push(Row::Item(Line::from(spans)));
     }
@@ -1815,6 +1822,28 @@ mod tests {
         assert_eq!(app.picked().unwrap().key, 1);
         // The other key's own models went with it.
         assert_eq!(app.select_model_id("gpt-5"), Ok(false));
+    }
+
+    /// A count that is only part of the list has to say so on the row, in words, or it reads
+    /// as the whole thing.
+    #[test]
+    fn a_partial_count_says_at_least() {
+        let whole = |n| {
+            model_count(catalog::Count {
+                total: n,
+                floor: false,
+            })
+        };
+        let part = |n| {
+            model_count(catalog::Count {
+                total: n,
+                floor: true,
+            })
+        };
+        assert_eq!(whole(7).trim(), "7 models");
+        assert_eq!(whole(1).trim(), "1 model");
+        assert_eq!(part(7).trim(), "at least 7 models");
+        assert_eq!(part(1).trim(), "at least 1 model");
     }
 
     #[test]
