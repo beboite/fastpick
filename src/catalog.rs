@@ -358,29 +358,46 @@ fn read_cache(provider_id: &str, key_id: &str) -> Option<Cached> {
     serde_json::from_str(&raw).ok()
 }
 
+/// How many models a provider serves, and whether that is the whole answer.
+///
+/// A site holding several keys is counted key by key, and the keys are cached separately, so
+/// one of them having never been fetched is the ordinary state rather than an error. `floor`
+/// says so: the number is real, it is simply not the end of the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Count {
+    pub total: usize,
+    pub floor: bool,
+}
+
 /// How many models the last fetch left on disk for this provider, summed over the keys that
 /// can serve the harness, config overrides included. Read from the cache only: the menu
 /// shows it before anything is fetched, so it must never touch the network.
 ///
-/// `None` as soon as one key has nothing on disk. A partial sum would read as the whole
-/// list, which is worse than admitting the count is not known yet.
-pub fn cached_count(p: &Provider, harness_id: &str) -> Option<usize> {
+/// A key with nothing on disk still contributes its config models and sets `floor`. Saying
+/// nothing at all used to be the answer there, which meant one uncached key blanked the
+/// count for a whole site; a bare sum would have been worse, reading as the entire list.
+pub fn cached_count(p: &Provider, harness_id: &str) -> Option<Count> {
     let keys = p.keys_for(harness_id);
     if keys.is_empty() {
         return None;
     }
     let mut total = 0;
+    let mut floor = false;
     for i in keys {
         let k = &p.keys[i];
-        total += match k.catalog {
-            None => k.models.len(),
-            Some(_) => {
-                let c = read_cache(&p.id, &k.id)?;
-                merge(&k.models, &c.models).len()
-            }
-        };
+        match k.catalog {
+            None => total += k.models.len(),
+            Some(_) => match read_cache(&p.id, &k.id) {
+                Some(c) => total += merge(&k.models, &c.models).len(),
+                None => {
+                    total += k.models.len();
+                    floor = true;
+                }
+            },
+        }
     }
-    Some(total)
+    // Nothing known at all reads better as silence than as "at least 0 models".
+    (total > 0 || !floor).then_some(Count { total, floor })
 }
 
 fn write_cache(provider_id: &str, key_id: &str, models: &[Entry]) {
@@ -580,6 +597,53 @@ mod tests {
         assert_eq!(merged[0].label.as_deref(), Some("Nice name"));
         // The config said nothing about the window, so the catalogue fills it in.
         assert_eq!(merged[0].context_window, Some(262144));
+    }
+
+    /// Keys are cached one file each, so a site holding several is normally part-cached. The
+    /// count says how much of it is known rather than going blank on the whole provider.
+    #[test]
+    fn one_uncached_key_lowers_the_count_instead_of_erasing_it() {
+        // A provider id nothing has ever fetched, so the catalogue key has no file on disk
+        // whatever this machine has cached.
+        let cfg: crate::config::Config = crate::config::Config::parse(
+            r#"
+            [[harness]]
+            id = "claude-code"
+            name = "Claude Code"
+            kind = "claude-code"
+            bin = "claude"
+
+            [[provider]]
+            id = "fastpick-test-partly-cached"
+            name = "Partly"
+
+            [[provider.key]]
+            id = "listed"
+            [provider.key.harness.claude-code]
+            base_url = "https://partly.invalid"
+            [[provider.key.model]]
+            id = "a"
+            [[provider.key.model]]
+            id = "b"
+
+            [[provider.key]]
+            id = "fetched"
+            [provider.key.catalog]
+            url = "https://partly.invalid/v1/models"
+            [provider.key.harness.claude-code]
+            base_url = "https://partly.invalid"
+            [[provider.key.model]]
+            id = "c"
+            "#,
+        )
+        .unwrap();
+
+        let c = cached_count(&cfg.providers[0], "claude-code").unwrap();
+        assert_eq!(c.total, 3, "the config models of both keys are known");
+        assert!(c.floor, "the fetched key has nothing on disk yet");
+
+        // A harness no key binds is a different answer from a partial one.
+        assert_eq!(cached_count(&cfg.providers[0], "codex"), None);
     }
 
     #[test]
