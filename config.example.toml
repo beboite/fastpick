@@ -8,7 +8,8 @@
 #
 #   fastpick --edit           open this file
 #   fastpick --paths          every path fastpick uses, and the state of each key file
-#   fastpick --set-key <id>   write a provider's key, read from stdin, owner-only
+#   fastpick --set-key <id>   write a key, read from stdin, owner-only. <id> is a provider,
+#                             or <provider>.<key> when it holds several
 #   fastpick --list           what this file declares, and what is installed
 #
 # Paths take ~, $VAR and %VAR%, so the same file works on Windows, macOS and Linux. Only
@@ -29,6 +30,13 @@
 # [provider.catalog], the answer is cached, and [[provider.model]] below only layers on
 # what no API reports: a nicer name, a context window, effort levels, or an id that works
 # but is not advertised.
+#
+# A site that issues one key per upstream group needs several credentials behind one menu
+# entry, so a provider may declare [[provider.key]] blocks instead. Each key then owns its
+# own `auth_token_file`, catalogue, bindings, models, proxy and host check, and the provider
+# keeps only `id`, `name`, `group` and a shared `env`. See the last example at the bottom.
+# The two shapes cannot be mixed: a provider declaring keys is refused if it also leaves a
+# route field on itself, naming the field to move.
 
 # Where the .md files offered as system prompts live. Left commented on purpose: unset, it
 # is `system-prompts` next to this file, which is the folder the first run just created,
@@ -229,3 +237,55 @@ small_fast_model = "local-model"
   context_window = 262144
   # A self-hosted server may divide its configured window across concurrent slots. Declare
   # what one session actually gets, not the number in the server's command line.
+
+
+# ------------------------------------------------------------------------- several keys
+# One site, one menu entry, one credential per upstream group. Write it this way when a
+# provider issues a key per group and the groups differ in what they serve or in which API
+# surfaces they allow, which is what makes one shared block impossible.
+#
+# The keys are disjoint here, so the model picked is enough to know which credential, which
+# endpoint, and whether a proxy has to come up first. The menu writes each key's `label`
+# dim beside its models, and the filter matches that label too.
+[[provider]]
+id = "example-groups"
+name = "Example with one key per group"
+
+  # The site's own, shared by every key below. A key's `env` is layered on top and wins.
+  [provider.env]
+  SOME_VENDOR_TELEMETRY = "0"
+
+  [[provider.key]]
+  # Unique inside this provider and free of `.`, since `<provider>.<key>` is how
+  # --set-key and --paths name it: `fastpick --set-key example-groups.first`.
+  id = "first"
+  label = "first"
+  auth_token_file = "~/.example/first.key"
+  small_fast_model = "first-mini"
+
+    [provider.key.catalog]
+    url = "https://example.invalid/v1/models"
+
+    [provider.key.harness.claude-code]
+    base_url = "https://example.invalid"
+
+    [[provider.key.model]]
+    id = "first-mini"
+
+  [[provider.key]]
+  id = "second"
+  label = "second"
+  auth_token_file = "~/.example/second.key"
+
+    [provider.key.catalog]
+    url = "https://example.invalid/v1/models"
+
+    # Bound here and not on the key above, because only this group answers the surface
+    # Codex needs. Picking Codex therefore narrows the menu to this key's models on its own.
+    [provider.key.harness.codex]
+    base_url = "https://example.invalid/v1"
+    wire_api = "responses"
+
+    [[provider.key.model]]
+    id = "second-large"
+    context_window = 400000

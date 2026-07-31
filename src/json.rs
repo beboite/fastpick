@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::catalog::{self, Source};
-use crate::config::{Config, Provider};
+use crate::config::{Config, Provider, ProviderKey};
 use crate::launch::{self, Selection};
 use crate::paths::expand;
 use crate::prompts;
@@ -24,7 +24,10 @@ use crate::prompts;
 /// Bumped only when a consumer would have to change. A new field is not a bump.
 /// 2: `note` dropped from harnesses, providers and models. It never carried anything a
 /// caller could act on, only prose about one machine's setup.
-pub const SCHEMA: u32 = 2;
+/// 3: a provider reports its keys. `needsKey`, `keyPresent`, `harnesses`, `proxyPort` and
+/// `hostCheck` moved off the provider and onto each key, because a provider holding two
+/// subscriptions answers those questions differently for each of them.
+pub const SCHEMA: u32 = 3;
 
 /// Environment variables whose value is a credential. Matched by exact name, never by
 /// substring: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` also contains `TOKEN`, and hiding a context
@@ -81,8 +84,24 @@ struct ProviderView {
     id: String,
     name: String,
     group: Option<String>,
-    /// Whether this provider authenticates with a key file at all. `false` means the
-    /// harness keeps its own login.
+    /// Never empty: a provider written the short way still reports one key, whose id is the
+    /// provider's own.
+    keys: Vec<KeyView>,
+}
+
+/// One credential and the route it reaches. Everything here is per-credential because two
+/// keys on the same site can bind different harnesses and sit behind different proxies.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyView {
+    /// What `--provider` takes after the dot, and the whole id on a provider holding one
+    /// key, where it equals the provider's.
+    id: String,
+    /// Shown beside a model to say which subscription serves it. Null when there is only
+    /// one key and so nothing to tell apart.
+    label: Option<String>,
+    /// Whether this key authenticates with a key file at all. `false` means the harness
+    /// keeps its own login.
     needs_key: bool,
     /// Whether that file is there right now. The path is deliberately not reported: a
     /// caller decides whether to offer the row, it never reads the file itself.
@@ -140,12 +159,19 @@ struct SourceView {
     age_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// One `<key>: <reason>` per key whose catalogue could not be reached, when several were
+    /// asked. Omitted when they all answered, so its presence alone means the list is short.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    failed: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelView {
     id: String,
+    /// Id of the key that serves this model. A launch has to use that one: another key on
+    /// the same provider may not list this model at all.
+    key: String,
     label: Option<String>,
     context_window: Option<u64>,
     effort: Vec<String>,
@@ -156,35 +182,42 @@ struct ModelView {
 
 impl From<&Source> for SourceView {
     fn from(s: &Source) -> SourceView {
-        let (kind, count, age_secs, error) = match s {
-            Source::Live(n) => ("live", Some(*n), None, None),
-            Source::Cache(n, age) => ("cache", Some(*n), Some(*age), None),
+        let (kind, count, age_secs, error, failed) = match s {
+            Source::Live(n) => ("live", Some(*n), None, None, Vec::new()),
+            Source::Cache(n, age) => ("cache", Some(*n), Some(*age), None, Vec::new()),
             // Kept apart from `cache`: a consumer has to be able to tell "still fresh" from
             // "served because the fetch failed", which is what the error field says here.
-            Source::Stale(n, age, e) => ("stale", Some(*n), Some(*age), Some(e.clone())),
-            Source::Config(n) => ("config", Some(*n), None, None),
-            Source::Failed(e) => ("failed", None, None, Some(e.clone())),
+            Source::Stale(n, age, e) => {
+                ("stale", Some(*n), Some(*age), Some(e.clone()), Vec::new())
+            }
+            Source::Config(n) => ("config", Some(*n), None, None, Vec::new()),
+            Source::Failed(e) => ("failed", None, None, Some(e.clone()), Vec::new()),
+            // One entry per key that could not be reached, since the merged list is still
+            // usable and naming the whole thing failed would be wrong.
+            Source::Several { count, .. } => {
+                ("several", Some(*count), None, None, s.failures().to_vec())
+            }
         };
         SourceView {
             kind,
             count,
             age_secs,
             error,
+            failed,
         }
     }
 }
 
-fn provider_view(p: &Provider) -> ProviderView {
-    ProviderView {
-        id: p.id.clone(),
-        name: p.name.clone(),
-        group: p.group.clone(),
-        needs_key: p.auth_token_file.is_some(),
-        key_present: p
+fn key_view(k: &ProviderKey) -> KeyView {
+    KeyView {
+        id: k.id.clone(),
+        label: k.label.clone(),
+        needs_key: k.auth_token_file.is_some(),
+        key_present: k
             .auth_token_file
             .as_deref()
             .is_some_and(|f| expand(f).is_file()),
-        harnesses: p
+        harnesses: k
             .harness
             .iter()
             .map(|(id, b)| {
@@ -198,11 +231,20 @@ fn provider_view(p: &Provider) -> ProviderView {
                 )
             })
             .collect(),
-        proxy_port: p.proxy.as_ref().map(|x| x.port),
-        host_check: p.host_check.as_ref().map(|c| HostCheckView {
+        proxy_port: k.proxy.as_ref().map(|x| x.port),
+        host_check: k.host_check.as_ref().map(|c| HostCheckView {
             host: c.host.clone(),
             on_down: c.on_down.to_string(),
         }),
+    }
+}
+
+fn provider_view(p: &Provider) -> ProviderView {
+    ProviderView {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        group: p.group.clone(),
+        keys: p.keys.iter().map(key_view).collect(),
     }
 }
 
@@ -226,27 +268,33 @@ pub fn listing(
                 .iter()
                 .find(|p| p.id == id)
                 .ok_or_else(|| anyhow!("no provider with id `{id}`, see --list"))?;
-            let (models, source) = catalog::run(&catalog::Request::new(cfg, p, refresh));
+            // No harness to narrow by here, so every key is asked: a caller listing a
+            // provider wants the whole of what it serves, not one agent's slice of it.
+            let (rows, source) = catalog::run_all(catalog::requests_for(cfg, p, None, refresh));
             Some(ModelsView {
                 provider: p.id.clone(),
                 source: SourceView::from(&source),
-                items: models
+                items: rows
                     .iter()
-                    .map(|m| ModelView {
-                        id: m.id.clone(),
-                        label: m.label.clone(),
-                        context_window: m.context_window,
-                        effort: m.effort.clone(),
-                        effort_default: m.effort_default.clone(),
-                        prompts: dir
-                            .as_ref()
-                            .map(|d| {
-                                prompts::matches_for(d, m.base_name())
-                                    .into_iter()
-                                    .map(|f| f.stem)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
+                    .map(|row| {
+                        let m = &row.model;
+                        ModelView {
+                            id: m.id.clone(),
+                            key: p.keys[row.key].id.clone(),
+                            label: m.label.clone(),
+                            context_window: m.context_window,
+                            effort: m.effort.clone(),
+                            effort_default: m.effort_default.clone(),
+                            prompts: dir
+                                .as_ref()
+                                .map(|d| {
+                                    prompts::matches_for(d, m.base_name())
+                                        .into_iter()
+                                        .map(|f| f.stem)
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        }
                     })
                     .collect(),
             })
@@ -308,6 +356,9 @@ pub struct DryRun {
     schema: u32,
     harness: String,
     provider: String,
+    /// The route id the launch resolved to, `crof` or `codex-everywhere.openai`. It says
+    /// which credential was picked, which a provider id alone cannot.
+    key: String,
     model: String,
     effort: Option<String>,
     prompts: Vec<String>,
@@ -357,6 +408,7 @@ pub fn dry_run(cfg: &Config, sel: &Selection) -> Result<DryRun> {
         schema: SCHEMA,
         harness: sel.harness.id.clone(),
         provider: sel.provider.id.clone(),
+        key: sel.provider.route_id(sel.key),
         model: sel.model.id.clone(),
         effort: sel.effort.clone(),
         prompts: sel
@@ -372,11 +424,15 @@ pub fn dry_run(cfg: &Config, sel: &Selection) -> Result<DryRun> {
         env,
         secret_env,
         prechecks: Prechecks {
-            proxy_port: sel.provider.proxy.as_ref().map(|x| x.port),
-            host_check: sel.provider.host_check.as_ref().map(|c| HostCheckView {
-                host: c.host.clone(),
-                on_down: c.on_down.to_string(),
-            }),
+            proxy_port: sel.provider_key().proxy.as_ref().map(|x| x.port),
+            host_check: sel
+                .provider_key()
+                .host_check
+                .as_ref()
+                .map(|c| HostCheckView {
+                    host: c.host.clone(),
+                    on_down: c.on_down.to_string(),
+                }),
         },
     })
 }
@@ -442,7 +498,60 @@ mod tests {
             id = "claude-opus-5"
             "#
         );
-        let cfg: Config = toml::from_str(&toml).unwrap();
+        let cfg = Config::parse(&toml).unwrap();
+        (dir, cfg)
+    }
+
+    /// One provider holding two keys, each binding a different harness and listing its own
+    /// model. No key file and no catalogue, so nothing here touches the disk or the network.
+    fn multi_key_fixture() -> (TempDir, Config) {
+        let dir = TempDir::new();
+        let prompts = dir.path().join("system-prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        let prompts = prompts.display().to_string().replace('\\', "/");
+
+        let toml = format!(
+            r#"
+            system_prompts_dir = "{prompts}"
+
+            [[harness]]
+            id = "claude-code"
+            name = "Claude Code"
+            kind = "claude-code"
+            bin = "fastpick-test-claude"
+
+            [[harness]]
+            id = "codex"
+            name = "Codex"
+            kind = "codex"
+            bin = "fastpick-test-codex"
+
+            [[provider]]
+            id = "duo"
+            name = "Duo"
+
+            [[provider.key]]
+            id = "left"
+            label = "Left seat"
+
+            [provider.key.harness.claude-code]
+            base_url = "https://left.invalid"
+
+            [[provider.key.model]]
+            id = "left-model"
+
+            [[provider.key]]
+            id = "right"
+            label = "Right seat"
+
+            [provider.key.harness.codex]
+            base_url = "https://right.invalid"
+
+            [[provider.key.model]]
+            id = "right-model"
+            "#
+        );
+        let cfg = Config::parse(&toml).unwrap();
         (dir, cfg)
     }
 
@@ -497,8 +606,10 @@ mod tests {
             .find(|p| p["id"] == "acme")
             .unwrap()
             .clone();
-        assert_eq!(acme["needsKey"], true);
-        assert_eq!(acme["keyPresent"], true);
+        assert_eq!(acme["keys"][0]["needsKey"], true);
+        assert_eq!(acme["keys"][0]["keyPresent"], true);
+        // Written the short way, so the single key answers to the provider's own id.
+        assert_eq!(acme["keys"][0]["id"], "acme");
 
         let whole = serde_json::to_string(&v).unwrap();
         assert!(!whole.contains("sk-test-token"), "the key value leaked");
@@ -515,11 +626,11 @@ mod tests {
             .find(|p| p["id"] == "builtin")
             .unwrap()
             .clone();
-        assert_eq!(builtin["needsKey"], false);
-        assert_eq!(builtin["keyPresent"], false);
+        assert_eq!(builtin["keys"][0]["needsKey"], false);
+        assert_eq!(builtin["keys"][0]["keyPresent"], false);
         // Present but empty: "change nothing", which is not the same as no binding.
-        assert!(builtin["harnesses"]["claude-code"].is_object());
-        assert!(builtin["harnesses"]["claude-code"]["baseUrl"].is_null());
+        assert!(builtin["keys"][0]["harnesses"]["claude-code"].is_object());
+        assert!(builtin["keys"][0]["harnesses"]["claude-code"]["baseUrl"].is_null());
     }
 
     #[test]
@@ -569,7 +680,8 @@ mod tests {
         let sel = Selection {
             harness,
             provider,
-            binding: provider.binding("claude-code").unwrap(),
+            key: 0,
+            binding: provider.keys[0].binding("claude-code").unwrap(),
             model: &model,
             effort: None,
             prompts: Vec::new(),
@@ -583,8 +695,37 @@ mod tests {
         assert_eq!(v["secretEnv"]["ANTHROPIC_API_KEY"]["chars"], 0);
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "https://acme.invalid");
         assert_eq!(v["args"], serde_json::json!(["--model", "orca-v4-pro"]));
+        // One key, so the route id is the bare provider id rather than `acme.acme`.
+        assert_eq!(v["key"], "acme");
 
         let whole = serde_json::to_string(&v).unwrap();
         assert!(!whole.contains("sk-test-token"), "the key value leaked");
+    }
+
+    #[test]
+    fn each_key_reports_its_own_route_and_owns_the_models_it_serves() {
+        let (_d, cfg) = multi_key_fixture();
+        let out = listing(&cfg, Path::new("config.toml"), Some("duo"), false).unwrap();
+        let v = serde_json::to_value(&out).unwrap();
+
+        let keys = v["providers"][0]["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0]["id"], "left");
+        assert_eq!(keys[0]["label"], "Left seat");
+        // Two subscriptions, two different sets of harnesses: reporting one map for the
+        // provider would offer Codex a binding only the other key has.
+        assert!(keys[0]["harnesses"]["claude-code"].is_object());
+        assert!(keys[0]["harnesses"].get("codex").is_none());
+        assert!(keys[1]["harnesses"]["codex"].is_object());
+        assert!(keys[1]["harnesses"].get("claude-code").is_none());
+
+        let items = v["models"]["items"].as_array().unwrap();
+        let of = |id: &str| -> Value { items.iter().find(|m| m["id"] == id).unwrap().clone() };
+        assert_eq!(of("left-model")["key"], "left");
+        assert_eq!(of("right-model")["key"], "right");
+        // Several keys answered, and none of them failed.
+        assert_eq!(v["models"]["source"]["kind"], "several");
+        assert_eq!(v["models"]["source"]["count"], 2);
+        assert!(v["models"]["source"].get("failed").is_none());
     }
 }

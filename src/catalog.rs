@@ -17,9 +17,17 @@ use crate::paths::expand;
 /// Everything a lookup needs, owned, so it can run on a background thread while the menu
 /// stays responsive. Borrowing the config here would pin the fetch to the main thread and
 /// freeze the UI for the length of an HTTP timeout.
+///
+/// One request per key, never per provider: a key is asked what *it* may use, and two keys
+/// on the same site answer differently because they sit in different groups.
 #[derive(Debug, Clone)]
 pub struct Request {
     pub provider_id: String,
+    /// Index of the key inside its provider, carried through so a model row can say which
+    /// credential serves it.
+    pub key_idx: usize,
+    pub key_id: String,
+    pub key_label: Option<String>,
     pub catalog: Option<Catalog>,
     pub token_file: Option<String>,
     pub config_models: Vec<Model>,
@@ -28,16 +36,46 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn new(cfg: &Config, p: &Provider, force: bool) -> Request {
+    pub fn new(cfg: &Config, p: &Provider, key_idx: usize, force: bool) -> Request {
+        let k = &p.keys[key_idx];
         Request {
             provider_id: p.id.clone(),
-            catalog: p.catalog.clone(),
-            token_file: p.auth_token_file.clone(),
-            config_models: p.models.clone(),
+            key_idx,
+            key_id: k.id.clone(),
+            key_label: k.label.clone(),
+            catalog: k.catalog.clone(),
+            token_file: k.auth_token_file.clone(),
+            config_models: k.models.clone(),
             ttl_secs: cfg.catalog_ttl_secs,
             force,
         }
     }
+}
+
+/// One request per key that can serve `harness_id`, or per key outright when no harness
+/// narrows the list, which is what a bare `--list --provider X` wants.
+pub fn requests_for(
+    cfg: &Config,
+    p: &Provider,
+    harness_id: Option<&str>,
+    force: bool,
+) -> Vec<Request> {
+    let idx: Vec<usize> = match harness_id {
+        Some(h) => p.keys_for(h),
+        None => (0..p.keys.len()).collect(),
+    };
+    idx.into_iter()
+        .map(|i| Request::new(cfg, p, i, force))
+        .collect()
+}
+
+/// A model and the key that serves it. The pair is what the menu shows and what the launch
+/// resolves, so the endpoint and the token can never come from two different blocks.
+#[derive(Debug, Clone)]
+pub struct Listed {
+    pub key: usize,
+    pub key_label: Option<String>,
+    pub model: Model,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +109,10 @@ pub enum Source {
     Config(usize),
     /// The fetch failed and nothing was cached, so the config list is all there is.
     Failed(String),
+    /// Several keys answered and their lists were merged. One failing key does not empty the
+    /// menu, so the failures are carried alongside the count rather than replacing it, one
+    /// `<key>: <reason>` per line.
+    Several { count: usize, failed: Vec<String> },
 }
 
 impl Source {
@@ -83,6 +125,19 @@ impl Source {
             }
             Source::Config(n) => format!("{n} models, from the config"),
             Source::Failed(e) => format!("catalogue unreachable ({e}), config list only"),
+            Source::Several { count, failed } if failed.is_empty() => format!("{count} models"),
+            Source::Several { count, failed } => {
+                format!("{count} models, {} key(s) unreachable", failed.len())
+            }
+        }
+    }
+
+    /// One `<key>: <reason>` per key whose catalogue could not be reached. Empty for every
+    /// other kind, whose single failure the label already carries.
+    pub fn failures(&self) -> &[String] {
+        match self {
+            Source::Several { failed, .. } => failed,
+            _ => &[],
         }
     }
 }
@@ -106,23 +161,34 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-fn cache_path(provider_id: &str) -> Option<PathBuf> {
-    // The id is used as a file name, so keep it to something a file system accepts.
-    let safe: String = provider_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+/// One file per key, not per provider. Two keys on the same site list different models, so a
+/// single file would have each fetch overwrite the other's answer.
+fn cache_path(provider_id: &str, key_id: &str) -> Option<PathBuf> {
+    // The ids are used as a file name, so keep them to something a file system accepts.
+    let safe = |raw: &str| -> String {
+        raw.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
     // Collapsing every other character to `_` makes `acme.a`, `acme-a` and `acme_a` the
-    // same file, and one provider would then show another's models. The suffix keeps the
-    // name readable while making it unique again.
-    let tag = fnv1a(provider_id);
-    crate::config::config_dir().map(|d| d.join("catalog").join(format!("{safe}-{tag:08x}.json")))
+    // same file, and one key would then show another's models. The suffix keeps the name
+    // readable while making it unique again, and it is taken over the pair so that two
+    // providers whose ids differ only in punctuation cannot collide through their keys
+    // either.
+    let tag = fnv1a(&format!("{provider_id}\u{0}{key_id}"));
+    crate::config::config_dir().map(|d| {
+        d.join("catalog").join(format!(
+            "{}_{}-{tag:08x}.json",
+            safe(provider_id),
+            safe(key_id)
+        ))
+    })
 }
 
 /// FNV-1a, 32 bits. Not a checksum, just enough to tell two ids apart in a file name.
@@ -287,21 +353,38 @@ fn short_http_error(e: ureq::Error) -> String {
     }
 }
 
-fn read_cache(provider_id: &str) -> Option<Cached> {
-    let raw = std::fs::read_to_string(cache_path(provider_id)?).ok()?;
+fn read_cache(provider_id: &str, key_id: &str) -> Option<Cached> {
+    let raw = std::fs::read_to_string(cache_path(provider_id, key_id)?).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-/// How many models the last fetch left on disk for this provider, config overrides
-/// included. Read from the cache only: the menu shows it before anything is fetched, so it
-/// must never touch the network.
-pub fn cached_count(config_models: &[Model], provider_id: &str) -> Option<usize> {
-    let c = read_cache(provider_id)?;
-    Some(merge(config_models, &c.models).len())
+/// How many models the last fetch left on disk for this provider, summed over the keys that
+/// can serve the harness, config overrides included. Read from the cache only: the menu
+/// shows it before anything is fetched, so it must never touch the network.
+///
+/// `None` as soon as one key has nothing on disk. A partial sum would read as the whole
+/// list, which is worse than admitting the count is not known yet.
+pub fn cached_count(p: &Provider, harness_id: &str) -> Option<usize> {
+    let keys = p.keys_for(harness_id);
+    if keys.is_empty() {
+        return None;
+    }
+    let mut total = 0;
+    for i in keys {
+        let k = &p.keys[i];
+        total += match k.catalog {
+            None => k.models.len(),
+            Some(_) => {
+                let c = read_cache(&p.id, &k.id)?;
+                merge(&k.models, &c.models).len()
+            }
+        };
+    }
+    Some(total)
 }
 
-fn write_cache(provider_id: &str, models: &[Entry]) {
-    let Some(path) = cache_path(provider_id) else {
+fn write_cache(provider_id: &str, key_id: &str, models: &[Entry]) {
+    let Some(path) = cache_path(provider_id, key_id) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -335,7 +418,7 @@ pub fn run(r: &Request) -> (Vec<Model>, Source) {
         );
     }
 
-    let cached = read_cache(&r.provider_id);
+    let cached = read_cache(&r.provider_id, &r.key_id);
     let fresh = cached
         .as_ref()
         .filter(|c| !r.force && age_of(c).is_some_and(|age| age < r.ttl_secs));
@@ -348,7 +431,7 @@ pub fn run(r: &Request) -> (Vec<Model>, Source) {
 
     match fetch(r) {
         Ok(entries) => {
-            write_cache(&r.provider_id, &entries);
+            write_cache(&r.provider_id, &r.key_id, &entries);
             let merged = merge(&r.config_models, &entries);
             let n = merged.len();
             (merged, Source::Live(n))
@@ -377,6 +460,59 @@ pub fn run(r: &Request) -> (Vec<Model>, Source) {
 /// this second" and pins the entry fresh until the clock catches up.
 fn age_of(c: &Cached) -> Option<u64> {
     now().checked_sub(c.fetched_at)
+}
+
+/// Every key's list, concatenated in config order, each row carrying the key that serves it.
+///
+/// The lookups run at once, one thread per key: they are independent HTTP calls to the same
+/// site, so doing them in sequence would make a three-key provider three timeouts slow for
+/// no reason. A single key returns its own `Source` untouched, so a provider that never grew
+/// a second one reads exactly as it did before.
+pub fn run_all(reqs: Vec<Request>) -> (Vec<Listed>, Source) {
+    if reqs.len() == 1 {
+        let r = &reqs[0];
+        let (models, source) = run(r);
+        let rows = models
+            .into_iter()
+            .map(|model| Listed {
+                key: r.key_idx,
+                key_label: r.key_label.clone(),
+                model,
+            })
+            .collect();
+        return (rows, source);
+    }
+
+    let handles: Vec<_> = reqs
+        .into_iter()
+        .map(|r| std::thread::spawn(move || (r.clone(), run(&r))))
+        .collect();
+
+    let mut rows = Vec::new();
+    let mut failed = Vec::new();
+    for h in handles {
+        // A panicking lookup thread is not worth taking the menu down for: the other keys
+        // still have something to show, so it is reported like any unreachable catalogue.
+        let Ok((r, (models, source))) = h.join() else {
+            failed.push("a catalogue lookup panicked".to_string());
+            continue;
+        };
+        // `Stale` counts too: the list is there, but it is the one a failed fetch fell back
+        // on, and saying so is the whole point of keeping the two apart.
+        match &source {
+            Source::Failed(e) => failed.push(format!("{}: {e}", r.key_id)),
+            Source::Stale(_, _, e) => failed.push(format!("{}: {e}", r.key_id)),
+            _ => {}
+        }
+        rows.extend(models.into_iter().map(|model| Listed {
+            key: r.key_idx,
+            key_label: r.key_label.clone(),
+            model,
+        }));
+    }
+
+    let count = rows.len();
+    (rows, Source::Several { count, failed })
 }
 
 /// Config first, then whatever the provider listed.
