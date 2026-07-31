@@ -47,6 +47,16 @@ model's default, so the usual case is one key. Right opens the options panel bes
 list, where space changes whatever the cursor is on and `a` lists every file in the prompts
 folder. `tab` refetches the model list and typing filters it.
 
+## Installing it
+
+```
+cargo install --git https://github.com/beboite/fastpick --locked
+```
+
+`--locked` builds against the lockfile in the repository rather than whatever resolves
+today. A binary built anywhere else works just as well: it reads a config and starts a
+child process, and has no install step of its own.
+
 ## Setting it up
 
 Run `fastpick` once: it writes a starter config and stops, because the providers it ships
@@ -67,6 +77,52 @@ Paths accept `~`, `$VAR` and `%VAR%`. Keys are referenced by file path, never in
 never reach a config file, a command line or a log. Every variable an adapter owns is either
 set or removed, so picking a third-party endpoint clears `ANTHROPIC_API_KEY` instead of
 sending it there.
+
+## One provider, several keys
+
+Some sites issue one key per upstream group, and the groups differ in which models they hold
+and which API surfaces they allow. A provider can therefore declare several `[[provider.key]]`
+blocks instead of one credential:
+
+```toml
+[[provider]]
+id = "acme"
+name = "Acme"
+
+  [[provider.key]]
+  id = "anthropic"                             # no `.` in it, see below
+  label = "anthropic"                          # written dim beside this key's models
+  auth_token_file = "~/.acme/anthropic.key"
+
+    [provider.key.harness.claude-code]
+    base_url = "https://acme.example"
+
+  [[provider.key]]
+  id = "openai"
+  auth_token_file = "~/.acme/openai.key"
+
+    [provider.key.harness.codex]
+    base_url = "https://acme.example/v1"
+    wire_api = "responses"
+
+    [[provider.key.model]]
+    id = "acme-gpt"
+```
+
+Everything describing a route lives on the key: its token file, catalogue, bindings, models,
+proxy and host check. The provider keeps `id`, `name`, `group` and an `env` each key layers
+its own over. Leaving a route field on a provider that declares keys is refused at load, with
+the field to move named, because a credential belonging to none of the keys is how the wrong
+one reaches an endpoint.
+
+The provider appears as soon as one key binds the harness, and the model list narrows to the
+keys that do, so picking Codex above shows the `openai` key's models alone. The model picked
+resolves the key, which is what keeps the endpoint and the token from coming out of two
+different blocks, and a proxy declared on one key never starts for a launch on another. Each
+key is asked its own catalogue, in parallel, and cached separately. On the command line a key
+is `<provider>.<key>`, so `fastpick --set-key acme.openai` writes one credential and
+`fastpick --set-key acme` errors and lists what it could have meant. A provider holding a
+single key keeps answering to its own id everywhere, and the short form above stays valid.
 
 ## Harnesses
 
@@ -93,6 +149,25 @@ single `SIGNATURES.json`. `fastpick --update` checks the minisign signature agai
 compiled into the running binary before replacing anything. The
 menu checks for a newer version once a day at most, on a background thread, and only ever
 prints a line naming the version: nothing installs itself.
+
+### Saying what the session became
+
+fastpick picks an agent and then becomes it, so a host that shows a tab per command ends up
+labelling a Claude Code session "fastpick". Right before the agent starts, fastpick says
+what it turned into, on the stream itself:
+
+```text
+ESC ] 1337 ; boite ; launch = {"cmd":"fastpick","args":[…],"iconKey":"claude","label":"Claude Code"} BEL
+```
+
+`args` is the command line that reaches this same combination with no menu, which is the
+useful half: a host that stores it reopens the session where it was rather than putting the
+picker back in the way.
+
+This is emitted only when `TERM_PROGRAM` names a host that asked for it, so every other
+terminal sees nothing at all. OSC 1337 is a `key=value` channel several terminals already
+share, and the `boite;` prefix means one that does not know this payload leaves it alone.
+No credential is in it; it is the command line you could have typed.
 
 ## Build
 

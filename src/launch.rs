@@ -26,11 +26,20 @@ pub const KEY_ENV: &str = "FASTPICK_PROVIDER_KEY";
 pub struct Selection<'a> {
     pub harness: &'a Harness,
     pub provider: &'a Provider,
+    /// Which of the provider's keys serves this launch. Decided by the model picked, since
+    /// a key only lists what its own group holds.
+    pub key: usize,
     pub binding: &'a Binding,
     pub model: &'a Model,
     pub effort: Option<String>,
     pub prompts: Vec<PathBuf>,
     pub passthrough: Vec<String>,
+}
+
+impl Selection<'_> {
+    pub fn provider_key(&self) -> &crate::config::ProviderKey {
+        &self.provider.keys[self.key]
+    }
 }
 
 /// A command under construction.
@@ -149,8 +158,8 @@ fn read_token(path: &PathBuf) -> Result<String> {
     Ok(token)
 }
 
-fn token_of(p: &Provider) -> Result<Option<String>> {
-    let Some(keyfile) = &p.auth_token_file else {
+fn token_of(p: &Provider, key: usize) -> Result<Option<String>> {
+    let Some(keyfile) = &p.keys[key].auth_token_file else {
         return Ok(None);
     };
     let path = expand(keyfile);
@@ -159,7 +168,7 @@ fn token_of(p: &Provider) -> Result<Option<String>> {
             "{}: missing key file {}. `fastpick --set-key {}` writes it",
             p.name,
             path.display(),
-            p.id
+            p.route_id(key)
         ));
     }
     // Said once, at the moment the file is actually read, and never fatal: refusing to
@@ -172,9 +181,14 @@ fn token_of(p: &Provider) -> Result<Option<String>> {
     Ok(Some(read_token(&path)?))
 }
 
-/// Starts the provider's proxy if nothing is listening yet, then waits for the port.
-fn ensure_proxy(p: &Provider) -> Result<()> {
-    let Some(proxy) = &p.proxy else { return Ok(()) };
+/// Starts the picked key's proxy if nothing is listening yet, then waits for the port.
+///
+/// On the key rather than the provider, so a site whose other groups speak the wire format
+/// natively never starts a translator they do not go through.
+fn ensure_proxy(p: &Provider, key: usize) -> Result<()> {
+    let Some(proxy) = &p.keys[key].proxy else {
+        return Ok(());
+    };
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, proxy.port));
 
     if TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok() {
@@ -300,8 +314,8 @@ fn host_is_up(host: &str) -> bool {
     stdout.contains("ttl=") || stdout.contains("ttl ")
 }
 
-fn run_host_check(p: &Provider) -> Result<()> {
-    let Some(check) = &p.host_check else {
+fn run_host_check(p: &Provider, key: usize) -> Result<()> {
+    let Some(check) = &p.keys[key].host_check else {
         return Ok(());
     };
     if host_is_up(&check.host) {
@@ -323,7 +337,7 @@ fn run_host_check(p: &Provider) -> Result<()> {
 /// real launch would do, environment included.
 pub fn build(cfg: &Config, sel: &Selection) -> Result<Command> {
     let mut cmd = Builder::new(&sel.harness.bin);
-    let token = token_of(sel.provider)?;
+    let token = token_of(sel.provider, sel.key)?;
 
     match sel.harness.kind {
         HarnessKind::ClaudeCode => claude_code(&mut cmd, sel, token.as_deref()),
@@ -331,8 +345,9 @@ pub fn build(cfg: &Config, sel: &Selection) -> Result<Command> {
         HarnessKind::Codex => codex(&mut cmd, sel, token.as_deref()),
     }
 
-    // Provider-wide first, then the binding's, so a harness-specific value wins.
-    for (k, v) in &sel.provider.env {
+    // The site's, then the key's over it, then the binding's, so the more specific of the
+    // three always wins.
+    for (k, v) in sel.provider.env_for(sel.key) {
         cmd.env(k, v);
     }
     for (k, v) in &sel.binding.env {
@@ -404,7 +419,7 @@ fn claude_code(cmd: &mut Builder, sel: &Selection, token: Option<&str>) {
         .model
         .small_fast_model
         .as_ref()
-        .or(sel.provider.small_fast_model.as_ref())
+        .or(sel.provider_key().small_fast_model.as_ref())
     {
         Some(sfm) => {
             cmd.env("ANTHROPIC_SMALL_FAST_MODEL", sfm);
@@ -483,7 +498,7 @@ fn opencode(cmd: &mut Builder, sel: &Selection, token: Option<&str>) -> Result<(
         .model
         .small_fast_model
         .as_ref()
-        .or(sel.provider.small_fast_model.as_ref())
+        .or(sel.provider_key().small_fast_model.as_ref())
     {
         cfg.insert("small_model".into(), format!("{pid}/{sfm}").into());
     }
@@ -577,8 +592,8 @@ fn codex(cmd: &mut Builder, sel: &Selection, token: Option<&str>) {
 
 /// Runs the prechecks, then hands the terminal to the agent and returns its exit code.
 pub fn run(cfg: &Config, sel: &Selection) -> Result<i32> {
-    run_host_check(sel.provider)?;
-    ensure_proxy(sel.provider)?;
+    run_host_check(sel.provider, sel.key)?;
+    ensure_proxy(sel.provider, sel.key)?;
 
     let mut cmd = build(cfg, sel)?;
     let status = cmd
@@ -676,7 +691,7 @@ mod tests {
             id = "acme-large"
             "#
         );
-        let cfg: Config = toml::from_str(&toml).unwrap();
+        let cfg = Config::parse(&toml).unwrap();
         (dir, cfg)
     }
 
@@ -706,12 +721,29 @@ mod tests {
         provider_id: &str,
         model: &'a Model,
     ) -> Selection<'a> {
+        selection_on_key(cfg, harness_id, provider_id, None, model)
+    }
+
+    /// `key_id` picks one of a multi-key provider's credentials; `None` takes the first that
+    /// binds the harness, which is what a single-key provider always has.
+    fn selection_on_key<'a>(
+        cfg: &'a Config,
+        harness_id: &str,
+        provider_id: &str,
+        key_id: Option<&str>,
+        model: &'a Model,
+    ) -> Selection<'a> {
         let harness = cfg.harnesses.iter().find(|h| h.id == harness_id).unwrap();
         let provider = cfg.providers.iter().find(|p| p.id == provider_id).unwrap();
+        let key = match key_id {
+            Some(id) => provider.keys.iter().position(|k| k.id == id).unwrap(),
+            None => provider.keys_for(harness_id)[0],
+        };
         Selection {
             harness,
             provider,
-            binding: provider.binding(harness_id).unwrap(),
+            key,
+            binding: provider.keys[key].binding(harness_id).unwrap(),
             model,
             effort: None,
             prompts: Vec::new(),
@@ -877,7 +909,10 @@ mod tests {
             [[provider.model]]
             id = "m"
         "#;
-        let broken: Config = toml::from_str(toml).unwrap();
+        // Not `parse`: `validate` now refuses this at load, and the point here is the guard
+        // the adapter itself keeps, which a config reaching `build` by any other route would
+        // still run into.
+        let broken = Config::parse_unvalidated(toml).unwrap();
         let m = Model::new("m".into());
         let sel = selection(&broken, "opencode", "acme", &m);
         let err = build(&cfg, &sel).unwrap_err().to_string();
@@ -910,6 +945,125 @@ mod tests {
         assert_eq!(env_of(&cmd, KEY_ENV).as_deref(), Some("sk-test-token"));
     }
 
+    /// The whole point of keys: two subscriptions on one site, and a launch that picks one
+    /// must not borrow anything from the other.
+    #[test]
+    fn a_launch_takes_its_endpoint_token_and_background_model_from_one_key_only() {
+        let dir = TempDir::new();
+        let write = |name: &str, body: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p.display().to_string().replace('\\', "/")
+        };
+        let first = write("first.key", "sk-first\n");
+        let second = write("second.key", "sk-second\n");
+
+        let toml = format!(
+            r#"
+            [[harness]]
+            id = "claude-code"
+            name = "Claude Code"
+            kind = "claude-code"
+            bin = "fastpick-test-claude"
+
+            [[provider]]
+            id = "acme"
+            name = "Acme"
+
+            [provider.env]
+            SHARED = "site"
+
+            [[provider.key]]
+            id = "first"
+            auth_token_file = "{first}"
+            small_fast_model = "first-mini"
+            [provider.key.env]
+            SHARED = "first"
+            [provider.key.harness.claude-code]
+            base_url = "https://first.invalid"
+            [[provider.key.model]]
+            id = "first-large"
+
+            [[provider.key]]
+            id = "second"
+            auth_token_file = "{second}"
+            small_fast_model = "second-mini"
+            [provider.key.harness.claude-code]
+            base_url = "https://second.invalid"
+            [[provider.key.model]]
+            id = "second-large"
+            "#
+        );
+        let cfg = Config::parse(&toml).unwrap();
+        let m = Model::new("second-large".into());
+        let sel = selection_on_key(&cfg, "claude-code", "acme", Some("second"), &m);
+        let cmd = build(&cfg, &sel).unwrap();
+
+        assert_eq!(
+            env_of(&cmd, "ANTHROPIC_BASE_URL").as_deref(),
+            Some("https://second.invalid")
+        );
+        assert_eq!(
+            env_of(&cmd, "ANTHROPIC_AUTH_TOKEN").as_deref(),
+            Some("sk-second"),
+            "the token has to come from the key that serves the model"
+        );
+        assert_eq!(
+            env_of(&cmd, "ANTHROPIC_SMALL_FAST_MODEL").as_deref(),
+            Some("second-mini"),
+            "the background model is per key: the other key's group does not serve it"
+        );
+        assert_eq!(
+            env_of(&cmd, "SHARED").as_deref(),
+            Some("site"),
+            "only the picked key may override what the site declares"
+        );
+
+        let sel = selection_on_key(&cfg, "claude-code", "acme", Some("first"), &m);
+        let cmd = build(&cfg, &sel).unwrap();
+        assert_eq!(env_of(&cmd, "SHARED").as_deref(), Some("first"));
+        assert_eq!(
+            env_of(&cmd, "ANTHROPIC_AUTH_TOKEN").as_deref(),
+            Some("sk-first")
+        );
+    }
+
+    /// A missing key file has to name the key, not the provider, or the hint sends you to
+    /// rewrite whichever credential `--set-key` guessed at.
+    #[test]
+    fn a_missing_key_file_points_at_the_route_that_needs_it() {
+        let toml = r#"
+            [[harness]]
+            id = "claude-code"
+            name = "Claude Code"
+            kind = "claude-code"
+            bin = "fastpick-test-claude"
+
+            [[provider]]
+            id = "acme"
+            name = "Acme"
+
+            [[provider.key]]
+            id = "first"
+            auth_token_file = "/fastpick-test/does-not-exist.key"
+            [provider.key.harness.claude-code]
+            base_url = "https://first.invalid"
+            [[provider.key.model]]
+            id = "m"
+
+            [[provider.key]]
+            id = "second"
+            [provider.key.harness.claude-code]
+            [[provider.key.model]]
+            id = "m"
+        "#;
+        let cfg = Config::parse(toml).unwrap();
+        let m = Model::new("m".into());
+        let sel = selection_on_key(&cfg, "claude-code", "acme", Some("first"), &m);
+        let err = build(&cfg, &sel).unwrap_err().to_string();
+        assert!(err.contains("--set-key acme.first"), "{err}");
+    }
+
     #[test]
     fn codex_on_a_builtin_provider_overrides_nothing() {
         let (_d, cfg) = fixture();
@@ -929,7 +1083,7 @@ mod tests {
             [[provider.model]]
             id = "gpt-5.6"
         "#;
-        let native: Config = toml::from_str(toml).unwrap();
+        let native = Config::parse(toml).unwrap();
         let m = Model::new("gpt-5.6".into());
         let sel = selection(&native, "codex", "builtin", &m);
         let cmd = build(&cfg, &sel).unwrap();

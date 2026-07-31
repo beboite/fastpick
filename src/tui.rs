@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use crate::catalog::{self, Source};
+use crate::catalog::{self, Listed, Source};
 use crate::config::{Config, Model};
 use crate::prompts::{self, PromptFile};
 
@@ -28,6 +28,10 @@ pub enum Screen {
 pub struct Picked {
     pub harness_idx: usize,
     pub provider_idx: usize,
+    /// Index of the key that serves this model inside its provider. Carried rather than
+    /// looked up again, because a provider can hold several keys and only the row the user
+    /// landed on knows which one listed the model.
+    pub key: usize,
     pub model: Model,
     pub effort: Option<String>,
     pub prompts: Vec<PathBuf>,
@@ -48,7 +52,7 @@ pub struct Start {
     pub refresh: bool,
 }
 
-type Fetched = (Vec<Model>, Source);
+type Fetched = (Vec<Listed>, Source);
 
 pub struct App<'a> {
     cfg: &'a Config,
@@ -65,7 +69,8 @@ pub struct App<'a> {
     /// once per harness switch rather than per frame: it reads files.
     provider_counts: Vec<Option<usize>>,
 
-    models: Vec<Model>,
+    /// Every key's models in one list, each row remembering the key that listed it.
+    models: Vec<Listed>,
     source: Option<Source>,
     rx: Option<Receiver<Fetched>>,
     spinner: usize,
@@ -193,26 +198,26 @@ impl<'a> App<'a> {
         self.cfg.providers.get(self.provider_idx()?)
     }
 
-    fn model(&self) -> Option<&Model> {
+    /// The selected row, model and serving key together. Nothing splits the two apart, so a
+    /// launch cannot end up with a model from one key and a token from another.
+    fn listed(&self) -> Option<&Listed> {
         self.models.get(*self.visible_models.get(self.model_idx)?)
     }
 
+    fn model(&self) -> Option<&Model> {
+        Some(&self.listed()?.model)
+    }
+
     fn rebuild_providers(&mut self) {
-        self.provider_rows = self.cfg.providers_for(&self.harness().id);
+        let harness_id = self.harness().id.clone();
+        self.provider_rows = self.cfg.providers_for(&harness_id);
         if self.provider_row >= self.provider_rows.len() {
             self.provider_row = self.provider_rows.len().saturating_sub(1);
         }
         self.provider_counts = self
             .provider_rows
             .iter()
-            .map(|&i| {
-                let p = &self.cfg.providers[i];
-                match p.catalog {
-                    // Nothing to fetch, so the config list is the count.
-                    None => Some(p.models.len()),
-                    Some(_) => catalog::cached_count(&p.models, &p.id),
-                }
-            })
+            .map(|&i| catalog::cached_count(&self.cfg.providers[i], &harness_id))
             .collect();
     }
 
@@ -230,7 +235,14 @@ impl<'a> App<'a> {
     /// Kicks off the catalogue lookup for the selected provider. Returns immediately.
     pub fn load_models(&mut self, force: bool) {
         let Some(p) = self.provider() else { return };
-        let req = catalog::Request::new(self.cfg, p, force || self.force_refresh);
+        // One lookup per key that can serve this harness. A key answers for what it may use,
+        // so asking the provider once would list models half the credentials cannot reach.
+        let reqs = catalog::requests_for(
+            self.cfg,
+            p,
+            Some(&self.harness().id),
+            force || self.force_refresh,
+        );
         self.force_refresh = false;
         self.models.clear();
         self.visible_models.clear();
@@ -240,7 +252,7 @@ impl<'a> App<'a> {
 
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(catalog::run(&req));
+            let _ = tx.send(catalog::run_all(reqs));
         });
         self.rx = Some(rx);
     }
@@ -259,9 +271,24 @@ impl<'a> App<'a> {
             // the loading indicator for ever with nothing left to answer it.
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.rx = None;
+                // The config list of every key that binds this harness, which is the same
+                // fallback the lookup itself would have degraded to.
+                let harness_id = self.harness().id.clone();
                 self.models = self
                     .provider()
-                    .map(|p| p.models.clone())
+                    .map(|p| {
+                        p.keys_for(&harness_id)
+                            .into_iter()
+                            .flat_map(|ki| {
+                                let k = &p.keys[ki];
+                                k.models.iter().map(move |m| catalog::Listed {
+                                    key: ki,
+                                    key_label: k.label.clone(),
+                                    model: m.clone(),
+                                })
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 self.source = Some(catalog::Source::Failed(
                     "the lookup stopped without answering".into(),
@@ -282,10 +309,15 @@ impl<'a> App<'a> {
             .models
             .iter()
             .enumerate()
-            .filter(|(_, m)| {
+            .filter(|(_, l)| {
+                // The key label is part of the row, so typing a subscription name narrows to
+                // the models that key serves rather than matching nothing.
                 needle.is_empty()
-                    || m.id.to_lowercase().contains(&needle)
-                    || m.display().to_lowercase().contains(&needle)
+                    || l.model.id.to_lowercase().contains(&needle)
+                    || l.model.display().to_lowercase().contains(&needle)
+                    || l.key_label
+                        .as_deref()
+                        .is_some_and(|k| k.to_lowercase().contains(&needle))
             })
             .map(|(i, _)| i)
             .collect();
@@ -300,11 +332,13 @@ impl<'a> App<'a> {
     /// row. `unwrap_or(0)` here used to answer "selected" while pointing at a different
     /// model, so `--model x` could launch y with nothing said about it.
     pub fn select_model_id(&mut self, id: &str) -> bool {
-        let Some(i) = self.models.iter().position(|m| m.id == id) else {
+        let Some(i) = self.models.iter().position(|l| l.model.id == id) else {
             return false;
         };
         // A filter left over from an earlier screen can hide a model that does exist. The
-        // named one wins over the filter.
+        // named one wins over the filter, and the cursor has to land on that exact row: the
+        // key comes off the row, so settling for another one would launch the right model
+        // with the wrong credential.
         if !self.visible_models.contains(&i) {
             self.filter.clear();
             self.rebuild_models();
@@ -314,6 +348,9 @@ impl<'a> App<'a> {
                 self.model_idx = row;
                 true
             }
+            // Unreachable with the filter cleared, and answered with `false` rather than
+            // row 0 anyway: the caller treats that as "not found" and opens the screen,
+            // where landing on someone else's row would silently swap the credential.
             None => false,
         }
     }
@@ -445,10 +482,12 @@ impl<'a> App<'a> {
     }
 
     pub fn picked(&self) -> Option<Picked> {
+        let listed = self.listed()?;
         Some(Picked {
             harness_idx: self.harness_idx(),
             provider_idx: self.provider_idx()?,
-            model: self.model()?.clone(),
+            key: listed.key,
+            model: listed.model.clone(),
             effort: self.effort_idx.and_then(|i| self.efforts.get(i)).cloned(),
             prompts: self
                 .checked
@@ -791,6 +830,9 @@ fn draw(f: &mut Frame, app: &App) {
                 status(app),
                 Style::new().fg(match &app.source {
                     Some(Source::Failed(_)) => Color::Yellow,
+                    // One key out of three being unreachable is a shorter list than the
+                    // user asked for, so it is coloured like an outright failure.
+                    Some(s) if !s.failures().is_empty() => Color::Yellow,
                     _ => Color::DarkGray,
                 }),
             )),
@@ -998,7 +1040,15 @@ fn status(app: &App) -> String {
                 SPINNER[app.spinner % SPINNER.len()],
                 app.provider().map(|p| p.name.as_str()).unwrap_or("")
             ),
-            (Some(s), false) => s.label(),
+            (Some(s), false) => {
+                let mut line = s.label();
+                // Naming the key that did not answer is the difference between a short list
+                // and a list the user believes is complete.
+                if !s.failures().is_empty() {
+                    line.push_str(&format!("   {}", s.failures().join("   ")));
+                }
+                line
+            }
             (None, false) => String::new(),
         },
         _ => String::new(),
@@ -1117,10 +1167,16 @@ fn model_body(app: &App) -> Body {
         .visible_models
         .iter()
         .filter_map(|&i| app.models.get(i))
-        .map(|m| {
+        .map(|l| {
+            let m = &l.model;
             let mut spans = vec![Span::raw(m.display().to_string())];
             if m.label.is_some() {
                 spans.push(dim(format!("  {}", m.id)));
+            }
+            // Only a provider holding several keys labels them, so a single-key row reads
+            // exactly as it did before this existed.
+            if let Some(key) = &l.key_label {
+                spans.push(dim(format!("  {key}")));
             }
             if let Some(ctx) = m.context_window {
                 spans.push(Span::styled(
@@ -1213,7 +1269,16 @@ mod tests {
     /// The bundled default config, which is also what a fresh install starts from: if the
     /// picker cannot render it, nobody's first run works.
     fn cfg() -> Config {
-        toml::from_str(crate::config::DEFAULT_CONFIG).expect("the shipped config must parse")
+        Config::parse(crate::config::DEFAULT_CONFIG).expect("the shipped config must parse")
+    }
+
+    /// One row as a provider holding a single key produces it: no label, key 0.
+    fn listed(id: &str) -> Listed {
+        Listed {
+            key: 0,
+            key_label: None,
+            model: Model::new(id.into()),
+        }
     }
 
     fn render(app: &App) -> String {
@@ -1265,7 +1330,14 @@ mod tests {
         m.context_window = Some(1_000_000);
         m.effort = vec!["low".into(), "medium".into(), "high".into(), "max".into()];
         m.effort_default = Some("high".into());
-        app.models = vec![m, Model::new("claude-sonnet-5".into())];
+        app.models = vec![
+            Listed {
+                key: 0,
+                key_label: None,
+                model: m,
+            },
+            listed("claude-sonnet-5"),
+        ];
         app.rebuild_models();
         for open in [false, true] {
             app.options_open = open;
@@ -1293,7 +1365,7 @@ mod tests {
         assert!(render(&app).contains(&provider));
 
         app.set_screen(Screen::Model);
-        app.models = vec![Model::new("some-model".into())];
+        app.models = vec![listed("some-model")];
         app.rebuild_models();
         assert!(render(&app).contains("some-model"));
 
@@ -1427,7 +1499,7 @@ mod tests {
     fn filtering_to_nothing_leaves_no_selectable_model() {
         let cfg = cfg();
         let mut app = App::new(&cfg, &Start::default());
-        app.models = vec![Model::new("a".into()), Model::new("b".into())];
+        app.models = vec![listed("a"), listed("b")];
         app.filter = "zzzz".into();
         app.rebuild_models();
         assert!(app.visible_models.is_empty());
@@ -1454,7 +1526,11 @@ mod tests {
         let mut m = Model::new("m".into());
         m.effort = vec!["high".into()];
         m.effort_default = Some("high".into());
-        app.models = vec![m];
+        app.models = vec![Listed {
+            key: 0,
+            key_label: None,
+            model: m,
+        }];
         app.rebuild_models();
         app.enter_options();
 
@@ -1470,7 +1546,7 @@ mod tests {
         let cfg = cfg();
         let mut app = App::new(&cfg, &Start::default());
         app.set_screen(Screen::Model);
-        app.models = vec![Model::new("a".into()), Model::new("b".into())];
+        app.models = vec![listed("a"), listed("b")];
         app.rebuild_models();
         app.ensure_options();
 
@@ -1502,11 +1578,51 @@ mod tests {
         let cfg = cfg();
         let mut app = App::new(&cfg, &Start::default());
         app.set_screen(Screen::Model);
-        app.models = vec![Model::new("a".into())];
+        app.models = vec![listed("a")];
         app.rebuild_models();
         app.ensure_options();
         assert!(!app.options_open);
         assert!(app.picked().is_some());
+    }
+
+    /// A provider holding two keys shows one list, and every row keeps the key that served
+    /// it. The launch reads that key, so a row losing it would send one key's model to
+    /// another key's endpoint.
+    #[test]
+    fn two_keys_share_one_list_and_each_row_keeps_its_own() {
+        let cfg = cfg();
+        let mut app = App::new(&cfg, &Start::default());
+        app.set_screen(Screen::Model);
+        app.models = vec![
+            Listed {
+                key: 0,
+                key_label: Some("openai".into()),
+                model: Model::new("gpt-5".into()),
+            },
+            Listed {
+                key: 1,
+                key_label: Some("anthropic".into()),
+                model: Model::new("claude-opus-5".into()),
+            },
+        ];
+        app.rebuild_models();
+        assert_eq!(app.visible_models.len(), 2);
+        assert_eq!(app.picked().unwrap().key, 0);
+
+        app.model_idx = 1;
+        let second = app.picked().unwrap();
+        assert_eq!(second.model.id, "claude-opus-5");
+        assert_eq!(second.key, 1);
+
+        // The label is a row of its own as far as the filter is concerned.
+        app.filter = "anthropic".into();
+        app.model_idx = 0;
+        app.rebuild_models();
+        assert_eq!(app.visible_models, vec![1]);
+        let only = app.picked().unwrap();
+        assert_eq!(only.model.id, "claude-opus-5");
+        assert_eq!(only.key, 1);
+        assert!(render(&app).contains("anthropic"));
     }
 
     #[test]

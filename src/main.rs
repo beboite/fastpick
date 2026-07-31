@@ -32,8 +32,9 @@ OPTIONS
   -e, --edit             open the config in $VISUAL, $EDITOR or the system default
   -l, --list             print the harnesses, providers and models, then exit
       --paths            print every path fastpick uses and the state of each key file
-      --set-key <id>     read a key from stdin and write it to that provider's key file,
-                         owner-readable. Never pass a key as an argument
+      --set-key <id>     read a key from stdin and write it to that key file, owner-readable.
+                         <id> is a provider, or <provider>.<key> when it holds several.
+                         Never pass a key as an argument
   -n, --dry-run          show the command and environment a launch would use, run nothing
       --json             print --list or --dry-run as JSON instead, for another program
   -r, --refresh          refetch the model catalogue instead of using the cached one
@@ -71,9 +72,9 @@ KEYS
 PATHS
   config    %APPDATA%\\fastpick\\config.toml, or $XDG_CONFIG_HOME/fastpick/config.toml,
             or ~/.config/fastpick/config.toml
-  catalog   <config dir>/catalog/, one JSON per provider, refreshed on a timer
+  catalog   <config dir>/catalog/, one JSON per key, refreshed on a timer
   prompts   whatever `system_prompts_dir` points at, `<config dir>/system-prompts` by default
-  keys      whatever each provider's `auth_token_file` points at. Run --paths to see them
+  keys      whatever each key's `auth_token_file` points at. Run --paths to see them
 ";
 
 fn main() -> ExitCode {
@@ -336,9 +337,9 @@ fn real_main() -> Result<i32> {
                 .with_context(|| format!("no provider with id `{id}`, see --list"))?;
             if let Some(h) = harness_idx {
                 let harness = &cfg.harnesses[h];
-                if cfg.providers[idx].binding(&harness.id).is_none() {
+                if !cfg.providers[idx].binds(&harness.id) {
                     anyhow::bail!(
-                        "provider `{id}` declares no binding for harness `{}`, so that pair cannot be launched",
+                        "provider `{id}` declares no binding for harness `{}` on any of its keys, so that pair cannot be launched",
                         harness.id
                     );
                 }
@@ -368,9 +369,11 @@ fn real_main() -> Result<i32> {
 
     let harness = &cfg.harnesses[picked.harness_idx];
     let provider = &cfg.providers[picked.provider_idx];
-    let binding = provider
+    // The key comes from the model: picking a row is what says which credential serves it,
+    // so the endpoint and the token can never be resolved from two different blocks.
+    let binding = provider.keys[picked.key]
         .binding(&harness.id)
-        .context("the chosen provider has no binding for the chosen harness")?;
+        .context("the chosen key has no binding for the chosen harness")?;
     state::save(&harness.id, &provider.id, &picked.model.id);
 
     let prompts = if args.md.is_empty() && !args.no_md {
@@ -382,6 +385,7 @@ fn real_main() -> Result<i32> {
     let sel = launch::Selection {
         harness,
         provider,
+        key: picked.key,
         binding,
         model: &picked.model,
         effort: args.effort.clone().or(picked.effort),
@@ -551,48 +555,67 @@ fn print_paths(cfg: &config::Config, cfg_path: &Path) {
     // learns where the key is, which they would learn from the config anyway.
     println!("\nkeys");
     for p in &cfg.providers {
-        match &p.auth_token_file {
-            None => println!("  {}  [{}]  the agent's own login", p.name, p.id),
-            Some(f) => {
-                let path = paths::expand(f);
-                let access = secrets::access(&path);
-                println!(
-                    "  {}  [{}]  {}  {}{}",
-                    p.name,
-                    p.id,
-                    path.display(),
-                    access.label(),
-                    match access {
-                        secrets::Access::Missing => format!("  (fastpick --set-key {})", p.id),
-                        _ => String::new(),
-                    }
-                );
+        for (ki, k) in p.keys.iter().enumerate() {
+            let route = p.route_id(ki);
+            match &k.auth_token_file {
+                None => println!("  {}  [{}]  the agent's own login", p.name, route),
+                Some(f) => {
+                    let path = paths::expand(f);
+                    let access = secrets::access(&path);
+                    println!(
+                        "  {}  [{}]  {}  {}{}",
+                        p.name,
+                        route,
+                        path.display(),
+                        access.label(),
+                        match access {
+                            secrets::Access::Missing => format!("  (fastpick --set-key {route})"),
+                            _ => String::new(),
+                        }
+                    );
+                }
             }
         }
     }
 }
 
-/// Writes one provider's key, read from stdin so it never reaches a shell history.
+/// Writes one key, read from stdin so it never reaches a shell history.
+///
+/// The argument is a route id: `crof` for a provider holding one credential,
+/// `codex-everywhere.openai` for one of several. A bare id on a provider holding several is
+/// refused rather than guessed at, because writing a subscription over the wrong file is
+/// silent until the next launch fails.
 fn set_key(cfg: &config::Config, id: &str) -> Result<i32> {
-    let p = cfg
-        .providers
-        .iter()
-        .find(|p| p.id == id)
-        .with_context(|| format!("no provider with id `{id}`, see --list"))?;
+    let Some((pi, ki)) = cfg.route(id) else {
+        if let Some(p) = cfg.providers.iter().find(|p| p.id == id) {
+            let names: Vec<String> = p.keys.iter().map(|k| format!("{id}.{}", k.id)).collect();
+            anyhow::bail!(
+                "provider `{id}` holds {} keys, so name the one to write: {}",
+                p.keys.len(),
+                names.join(", ")
+            );
+        }
+        anyhow::bail!("no provider or key with id `{id}`, see --list");
+    };
+    let p = &cfg.providers[pi];
+    let k = &p.keys[ki];
 
-    let Some(file) = &p.auth_token_file else {
+    let Some(file) = &k.auth_token_file else {
         anyhow::bail!(
-            "provider `{id}` declares no auth_token_file, so it has nowhere to keep a key. \
+            "`{id}` declares no auth_token_file, so it has nowhere to keep a key. \
              Give it one in the config, then run this again"
         );
     };
 
+    let label = match &k.label {
+        Some(l) => format!("{} ({l})", p.name),
+        None => p.name.clone(),
+    };
     let path = paths::expand(file);
-    let secret = secrets::read_secret(&format!("Key for {} (not shown): ", p.name))?;
+    let secret = secrets::read_secret(&format!("Key for {label} (not shown): "))?;
     secrets::write(&path, &secret)?;
     println!(
-        "{}: key written to {}, {}",
-        p.name,
+        "{label}: key written to {}, {}",
         path.display(),
         secrets::access(&path).label()
     );
@@ -624,24 +647,48 @@ fn print_list(cfg: &config::Config, args: &Args) -> Result<()> {
                 }
                 group = p.group.as_deref();
             }
-            let binding = p.binding(&h.id);
-            let url = binding
-                .and_then(|b| b.base_url.as_deref())
-                .unwrap_or("(the agent's own endpoint)");
-            println!("    {}  [{}]  {}", p.name, p.id, url);
+            let keys = p.keys_for(&h.id);
+            // One line per key that reaches this harness: two of them are two endpoints, and
+            // collapsing them would hide which credential a model is about to travel on.
+            if keys.len() < 2 {
+                let url = keys
+                    .first()
+                    .and_then(|&ki| p.keys[ki].binding(&h.id))
+                    .and_then(|b| b.base_url.as_deref())
+                    .unwrap_or("(the agent's own endpoint)");
+                println!("    {}  [{}]  {}", p.name, p.id, url);
+            } else {
+                println!("    {}  [{}]", p.name, p.id);
+                for &ki in &keys {
+                    let url = p.keys[ki]
+                        .binding(&h.id)
+                        .and_then(|b| b.base_url.as_deref())
+                        .unwrap_or("(the agent's own endpoint)");
+                    println!("      [{}]  {}", p.route_id(ki), url);
+                }
+            }
 
             // Listing every model of every provider would mean one HTTP call per provider
             // per harness, so the catalogue is only queried when a provider is named.
             if args.provider.as_deref() == Some(&p.id) {
-                let req = catalog::Request::new(cfg, p, args.refresh);
-                let (models, source) = catalog::run(&req);
+                let reqs = catalog::requests_for(cfg, p, Some(&h.id), args.refresh);
+                let (rows, source) = catalog::run_all(reqs);
                 println!("      {}", source.label());
-                for m in &models {
-                    let ctx = m
+                for line in source.failures() {
+                    println!("      {line}");
+                }
+                for row in &rows {
+                    let ctx = row
+                        .model
                         .context_window
                         .map(|c| format!("  {}K", c / 1000))
                         .unwrap_or_default();
-                    println!("      {}{}", m.id, ctx);
+                    let key = row
+                        .key_label
+                        .as_deref()
+                        .map(|l| format!("  [{l}]"))
+                        .unwrap_or_default();
+                    println!("      {}{}{}", row.model.id, ctx, key);
                 }
             }
         }
@@ -703,10 +750,10 @@ fn print_dry_run(cfg: &config::Config, sel: &launch::Selection) -> Result<()> {
         print!(" {}", a.to_string_lossy());
     }
     println!();
-    if let Some(proxy) = &sel.provider.proxy {
+    if let Some(proxy) = &sel.provider_key().proxy {
         println!("precheck: proxy on 127.0.0.1:{}", proxy.port);
     }
-    if let Some(check) = &sel.provider.host_check {
+    if let Some(check) = &sel.provider_key().host_check {
         println!("precheck: ping {} ({})", check.host, check.on_down);
     }
     Ok(())
