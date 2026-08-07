@@ -481,7 +481,7 @@ fn resolve_prompts(
         let Some(dir) = dir else {
             return Ok(Vec::new());
         };
-        return Ok(prompts::matches_for(&dir, model.base_name())
+        return Ok(prompts::matches_for(&dir, model.prompt_name())
             .into_iter()
             .take(1)
             .map(|f| f.path)
