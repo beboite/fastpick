@@ -288,7 +288,7 @@ pub fn listing(
                             prompts: dir
                                 .as_ref()
                                 .map(|d| {
-                                    prompts::matches_for(d, m.base_name())
+                                    prompts::matches_for(d, m.prompt_name())
                                         .into_iter()
                                         .map(|f| f.stem)
                                         .collect()
