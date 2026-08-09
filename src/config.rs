@@ -355,6 +355,14 @@ pub struct Model {
 
     #[serde(default)]
     pub small_fast_model: Option<String>,
+
+    /// What to match system prompt files against, when the id is not the model's own name.
+    /// An endpoint that routes by its own scheme serves `acme-orca-v4-pro` for what is
+    /// upstream an `orca-v4-pro`, and the file named after the model then matches nothing.
+    /// Naming the model here is the only honest fix: no amount of trimming can tell which
+    /// part of an arbitrary id is the endpoint's and which is the model's.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 impl Model {
@@ -367,6 +375,7 @@ impl Model {
             effort: Vec::new(),
             effort_default: None,
             small_fast_model: None,
+            prompt: None,
         }
     }
 
@@ -375,12 +384,19 @@ impl Model {
     }
 
     /// The model name with any window suffix removed, e.g. `claude-opus-5[1m]` becomes
-    /// `claude-opus-5`. Used to match system prompt files.
+    /// `claude-opus-5`.
     pub fn base_name(&self) -> &str {
         match self.id.find('[') {
             Some(i) => &self.id[..i],
             None => &self.id,
         }
+    }
+
+    /// What system prompt files are matched against: `prompt` when the config gives one,
+    /// the id without its window suffix otherwise. Every prompt lookup goes through this,
+    /// so a model declaring `prompt` is offered the same file wherever it is served from.
+    pub fn prompt_name(&self) -> &str {
+        self.prompt.as_deref().unwrap_or_else(|| self.base_name())
     }
 }
 
@@ -1345,5 +1361,43 @@ mod key_tests {
     #[test]
     fn the_bundled_example_config_loads() {
         Config::parse(DEFAULT_CONFIG).unwrap();
+    }
+
+    #[test]
+    fn a_model_says_which_prompt_file_it_wants_when_the_id_cannot() {
+        let cfg = Config::parse(
+            r#"
+            [[harness]]
+            id = "claude-code"
+            name = "Claude Code"
+            kind = "claude-code"
+            bin = "claude"
+
+            [[provider]]
+            id = "acme"
+            name = "Acme"
+            [provider.harness.claude-code]
+            base_url = "https://acme.invalid"
+
+            [[provider.model]]
+            id = "acme-orca-v4-pro"
+            prompt = "orca-v4"
+
+            [[provider.model]]
+            id = "orca-v4-pro[1m]"
+            "#,
+        )
+        .unwrap();
+        let models = &cfg.providers[0].keys[0].models;
+        assert_eq!(
+            models[0].prompt_name(),
+            "orca-v4",
+            "an id carrying the endpoint's own prefix matches nothing on its own"
+        );
+        assert_eq!(
+            models[1].prompt_name(),
+            "orca-v4-pro",
+            "without `prompt` it is still the id minus the window suffix"
+        );
     }
 }

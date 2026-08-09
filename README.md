@@ -49,6 +49,13 @@ model's default, so the usual case is one key. Right opens the options panel bes
 list, where space changes whatever the cursor is on and `a` lists every file in the prompts
 folder. `tab` refetches the model list and typing filters it.
 
+A file is matched to a model by its name: `orca-v4.md` covers `orca-v4-pro`, since a stem
+may be a prefix of the model. That breaks the moment an endpoint routes by its own scheme
+and calls the same model `acme-orca-v4-pro`, and it breaks quietly, with the file simply
+never offered. Give that model a `prompt = "orca-v4"` and matching uses the name you wrote
+rather than the id. There is no trimming rule instead of this on purpose: which part of an
+arbitrary id belongs to the endpoint is not something the code can know.
+
 ## Installing it
 
 ```

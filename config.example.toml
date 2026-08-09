@@ -161,6 +161,12 @@ small_fast_model = "example-small"
   context_window = 1000000
   compact_ratio = 0.9
   # small_fast_model = "example-tiny"   overrides the provider's, for this model only
+  # System prompt files are matched against the id, so an endpoint routing by its own
+  # scheme (`example-orca-v4-pro` for what is upstream an `orca-v4-pro`) matches nothing and
+  # the file is silently never offered. Name the model here and matching uses this instead.
+  # No trimming rule could do it for you: which half of an id is the endpoint's is a fact
+  # only the config knows.
+  # prompt = "orca-v4"
 
   # Anything the adapters do not cover, per provider or per binding. Values are passed to
   # the agent as written.

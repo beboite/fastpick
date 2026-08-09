@@ -447,7 +447,7 @@ impl<'a> App<'a> {
             return;
         };
         let Some(model) = self.model() else { return };
-        let base = model.base_name().to_string();
+        let base = model.prompt_name().to_string();
 
         let matches = prompts::matches_for(&dir, &base);
         self.prompt_matches = matches.len();
@@ -465,7 +465,7 @@ impl<'a> App<'a> {
             return;
         };
         let Some(model) = self.model() else { return };
-        let base = model.base_name().to_string();
+        let base = model.prompt_name().to_string();
 
         self.prompt_show_all = !self.prompt_show_all;
         let previously: Vec<PathBuf> = self
