@@ -857,6 +857,21 @@ fn draw(f: &mut Frame, app: &App) {
 
     f.render_widget(Paragraph::new(title(app)), Rect { height: 1, ..area });
 
+    // The line between the title and the list, which every other screen leaves blank. The
+    // model screen has always filtered on the keys typed into it and never said so, so the
+    // one screen with a search had the only invisible one.
+    if app.screen == Screen::Model && !app.options_open {
+        f.render_widget(
+            Paragraph::new(search_line(app)),
+            Rect {
+                y: area.y + 1,
+                height: 1,
+                width: left_width,
+                ..area
+            },
+        );
+    }
+
     let body_area = Rect {
         y: area.y + 2,
         height,
@@ -1060,6 +1075,44 @@ fn title(app: &App) -> Line<'static> {
 
 /// The name sits with the keys rather than in the title: the title answers "what is being
 /// asked", and which program is asking is a detail that belongs out of the way.
+/// The search box: what has been typed, a block for the caret, and how much of the list
+/// survives it.
+///
+/// Drawn even when nothing has been typed yet, because a search nobody can see is a search
+/// nobody uses: the placeholder is what says the keys go somewhere. The caret is a reversed
+/// space rather than a bar glyph, which every terminal draws the same, boite's included.
+fn search_line(app: &App) -> Line<'static> {
+    if app.loading() {
+        return Line::default();
+    }
+
+    let mut spans = vec![dim("search  ".to_string())];
+    if app.filter.is_empty() {
+        spans.push(Span::styled(
+            " ",
+            Style::new().add_modifier(Modifier::REVERSED),
+        ));
+        spans.push(dim("  type to narrow the list".to_string()));
+    } else {
+        spans.push(Span::styled(
+            app.filter.clone(),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            " ",
+            Style::new().add_modifier(Modifier::REVERSED),
+        ));
+        // The total is worth the width: a filter that hides more than it shows is the one
+        // case where the list on screen is not the list the provider serves.
+        spans.push(dim(format!(
+            "  {} of {}",
+            app.visible_models.len(),
+            app.models.len()
+        )));
+    }
+    Line::from(spans)
+}
+
 fn footer_line(app: &App) -> Line<'static> {
     Line::from(vec![
         Span::styled(
@@ -1077,7 +1130,7 @@ fn help(app: &App) -> &'static str {
         (Screen::Harness, _) => "up/down move   right next   q quit",
         (Screen::Provider, _) => "up/down move   right next   left back   q quit",
         (Screen::Model, false) => {
-            "up/down move   enter launch   right options   left back   type to filter   tab refetch"
+            "up/down move   enter launch   right options   left back   esc clear   tab refetch"
         }
         (Screen::Model, true) => {
             "up/down move   space change   a every file   enter launch   left back"
@@ -1572,6 +1625,48 @@ mod tests {
         assert!(app.picked().is_none());
         app.set_screen(Screen::Model);
         let _ = render(&app);
+    }
+
+    /// The search box is on screen before anything is typed, and it carries the letters as
+    /// they arrive. Filtering worked long before it was drawn, which is exactly why this
+    /// asserts on the render and not on `visible_models`.
+    #[test]
+    fn the_search_box_is_drawn_and_follows_what_is_typed() {
+        let cfg = cfg();
+        let mut app = App::new(&cfg, &Start::default());
+        app.set_screen(Screen::Model);
+        app.models = vec![listed("opus-5"), listed("sonnet-5"), listed("haiku-4-5")];
+        app.rebuild_models();
+
+        let empty = render(&app);
+        assert!(empty.contains("search"));
+        assert!(empty.contains("type to narrow the list"));
+
+        for c in "son".chars() {
+            app.filter.push(c);
+            app.model_idx = 0;
+            app.rebuild_models();
+        }
+        let drawn = render(&app);
+        assert!(drawn.contains("son"));
+        // The count is the point of the line: two of the three are hidden, and the list
+        // alone cannot say that.
+        assert!(drawn.contains("1 of 3"));
+        assert!(!drawn.contains("opus-5"));
+    }
+
+    /// The panel takes the keys while it is open, so the box that says "type to narrow"
+    /// would be lying next to it.
+    #[test]
+    fn the_search_box_goes_away_while_the_options_panel_is_open() {
+        let cfg = cfg();
+        let mut app = App::new(&cfg, &Start::default());
+        app.set_screen(Screen::Model);
+        app.models = vec![listed("opus-5")];
+        app.rebuild_models();
+        app.enter_options();
+        app.options_open = true;
+        assert!(!render(&app).contains("type to narrow the list"));
     }
 
     #[test]
