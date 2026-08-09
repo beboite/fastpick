@@ -76,6 +76,18 @@ bin = "codex"
 # No system prompt row: Codex has no append-only surface for one, and its instructions
 # override would replace the base prompt, tool rules included.
 
+[[harness]]
+id = "pi"
+name = "Pi"
+kind = "pi"
+bin = "pi"
+# Has no lever for an endpoint at launch: its built-in providers carry their own base url
+# and its models.json lives inside its config directory, which fastpick never writes to. So
+# a provider with a base_url is generated as an extension under fastpick's own config
+# directory and loaded with --extension. That needs the endpoint's dialect, which is `api`
+# on the binding. Extra instructions go through --append-system-prompt, which reads a file
+# when the value is a path and appends rather than replacing.
+
 # Every harness also takes these two, left out above because most setups need neither:
 #
 #   extra_args = ["--verbose"]   appended to every launch of this harness, whatever the
@@ -153,6 +165,12 @@ small_fast_model = "example-small"
   [provider.harness.codex]
   base_url = "https://example.invalid/v1"
   wire_api = "responses"
+
+  [provider.harness.pi]
+  base_url = "https://example.invalid"
+  # Which of pi's streaming implementations speaks this endpoint: anthropic-messages,
+  # openai-completions, openai-responses or google-generative-ai.
+  api = "anthropic-messages"
 
   # Layered on the fetched catalogue. Everything is optional.
   [[provider.model]]

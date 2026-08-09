@@ -73,6 +73,7 @@ pub enum HarnessKind {
     ClaudeCode,
     Opencode,
     Codex,
+    Pi,
 }
 
 impl HarnessKind {
@@ -84,6 +85,9 @@ impl HarnessKind {
             // Codex has no append-only surface: its instructions override replaces the
             // base prompt, tool rules included. Left unsupported rather than guessed at.
             HarnessKind::Codex => false,
+            // `--append-system-prompt` takes a value that is read as a file when one exists
+            // at that path, and appends rather than replacing.
+            HarnessKind::Pi => true,
         }
     }
 
@@ -267,6 +271,12 @@ pub struct Binding {
     #[serde(default)]
     pub wire_api: Option<WireApi>,
 
+    /// Pi only: which of its streaming implementations speaks this endpoint's dialect.
+    /// Pi has no environment variable for an endpoint and no wire-format guess: a provider
+    /// it does not ship is declared with its api, or it cannot be registered at all.
+    #[serde(default)]
+    pub api: Option<PiApi>,
+
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 
@@ -291,6 +301,32 @@ impl WireApi {
         match self {
             WireApi::Chat => "chat",
             WireApi::Responses => "responses",
+        }
+    }
+}
+
+/// The streaming implementation pi uses against a provider.
+///
+/// The names are pi's own, so the generated provider can carry them through untouched. Only
+/// the four an endpoint reached over HTTP can be: the cloud-SDK ones pi also ships (Bedrock,
+/// Vertex, Mistral) authenticate through their own client and have nothing a `base_url` and
+/// a bearer token would reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PiApi {
+    AnthropicMessages,
+    OpenaiCompletions,
+    OpenaiResponses,
+    GoogleGenerativeAi,
+}
+
+impl PiApi {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PiApi::AnthropicMessages => "anthropic-messages",
+            PiApi::OpenaiCompletions => "openai-completions",
+            PiApi::OpenaiResponses => "openai-responses",
+            PiApi::GoogleGenerativeAi => "google-generative-ai",
         }
     }
 }
@@ -347,6 +383,13 @@ pub struct Model {
     #[serde(default)]
     pub compact_ratio: Option<f64>,
 
+    /// Output cap, for a harness that asks for one. Only Pi does, and only because a model
+    /// it does not ship has to be described in full: left unset it takes pi's own default,
+    /// which is lower than what several endpoints allow and quietly truncates a long answer.
+    /// Never invented here — an invented cap is the same truncation with nobody to blame.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+
     #[serde(default)]
     pub effort: Vec<String>,
 
@@ -372,6 +415,7 @@ impl Model {
             label: None,
             context_window: None,
             compact_ratio: None,
+            max_tokens: None,
             effort: Vec::new(),
             effort_default: None,
             small_fast_model: None,
@@ -590,6 +634,14 @@ impl Config {
                     {
                         return Err(anyhow!(
                             "{whose} gives OpenCode a base_url but no `npm`, so OpenCode has no dialect to speak it with. Use `@ai-sdk/anthropic`, `@ai-sdk/openai-compatible` or `@ai-sdk/openai`."
+                        ));
+                    }
+                    if h.kind == HarnessKind::Pi
+                        && binding.base_url.is_some()
+                        && binding.api.is_none()
+                    {
+                        return Err(anyhow!(
+                            "{whose} gives Pi a base_url but no `api`, so Pi has no dialect to speak it with. Use `anthropic-messages`, `openai-completions`, `openai-responses` or `google-generative-ai`."
                         ));
                     }
                 }

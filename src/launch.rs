@@ -343,6 +343,7 @@ pub fn build(cfg: &Config, sel: &Selection) -> Result<Command> {
         HarnessKind::ClaudeCode => claude_code(&mut cmd, sel, token.as_deref()),
         HarnessKind::Opencode => opencode(&mut cmd, sel, token.as_deref())?,
         HarnessKind::Codex => codex(&mut cmd, sel, token.as_deref()),
+        HarnessKind::Pi => pi(&mut cmd, sel, token.as_deref())?,
     }
 
     // The site's, then the key's over it, then the binding's, so the more specific of the
@@ -524,6 +525,147 @@ fn opencode(cmd: &mut Builder, sel: &Selection, token: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// Pi: the endpoint travels as a generated extension, the model as a flag.
+///
+/// Pi is the one harness with no lever for an endpoint at launch. Its Anthropic provider
+/// hardcodes `https://api.anthropic.com` and passes it to the SDK explicitly, so
+/// `ANTHROPIC_BASE_URL` is read by nothing; its only other surface is `models.json`, which
+/// lives inside `~/.pi/agent` and is the user's own file. Writing there is the one thing
+/// this program does not do, and `PI_CODING_AGENT_DIR` would move the whole directory,
+/// taking their logins and their sessions with it.
+///
+/// What is left is `pi.registerProvider`, which an extension may call and which `--extension`
+/// loads from any path. So the provider is generated under fastpick's own config directory,
+/// one file per route, and rewritten at every launch — including a `--dry-run`, so the
+/// command it prints names a file that is really there.
+///
+/// The key is referenced as `$FASTPICK_PROVIDER_KEY` and resolved by pi at request time, so
+/// it stays in the process environment exactly as it does for the other three.
+fn pi(cmd: &mut Builder, sel: &Selection, token: Option<&str>) -> Result<()> {
+    // No base_url is one of pi's own providers, already known to it by this id and
+    // authenticated by whatever `/login` stored: nothing is generated and nothing overridden.
+    if let Some(url) = &sel.binding.base_url {
+        let api = sel.binding.api.ok_or_else(|| {
+            anyhow!(
+                "provider `{}` gives Pi a base_url but no `api`, so Pi has no dialect to speak it with. Use `anthropic-messages`, `openai-completions`, `openai-responses` or `google-generative-ai`.",
+                sel.provider.id
+            )
+        })?;
+        let body = pi_extension_body(sel, url, api, token.is_some())?;
+        let path = write_pi_extension(&sel.provider.route_id(sel.key), &body)?;
+        cmd.arg("--extension").arg(path);
+    }
+
+    // Always decided here rather than inherited: a value left in the environment by an
+    // earlier launch would be handed to this endpoint as its key.
+    match token {
+        Some(t) => cmd.env(KEY_ENV, t),
+        None => cmd.env_remove(KEY_ENV),
+    };
+
+    cmd.arg("--provider").arg(&sel.provider.id);
+    cmd.arg("--model").arg(&sel.model.id);
+    for prompt in &sel.prompts {
+        // Read as a file when one exists at that path, appended to the base prompt rather
+        // than replacing it.
+        cmd.arg("--append-system-prompt").arg(prompt);
+    }
+    Ok(())
+}
+
+/// Where a generated pi provider lives. One file per route, so two keys of one site never
+/// overwrite each other's endpoint.
+fn pi_extension_path(route: &str) -> Result<PathBuf> {
+    let dir = crate::config::config_dir()
+        .ok_or_else(|| anyhow!("no config directory to generate the pi provider in"))?
+        .join("pi");
+    let safe: String = route
+        .chars()
+        .map(|c| match c {
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' => c,
+            _ => '-',
+        })
+        .collect();
+    Ok(dir.join(format!("{safe}.ts")))
+}
+
+/// The extension source for one route.
+///
+/// Pure, and separate from the write for that reason: what this produces is the whole
+/// contract with pi, and the tests read it without a directory to put it in.
+///
+/// Both arguments are printed through `serde_json`, so a name or a url holding a quote
+/// cannot close a string and turn the rest of the file into code. `models` replaces the
+/// provider's list rather than adding to it, which is why only the picked model is
+/// declared: the same choice the OpenCode adapter makes.
+fn pi_extension_body(
+    sel: &Selection,
+    url: &str,
+    api: crate::config::PiApi,
+    has_token: bool,
+) -> Result<String> {
+    let mut model = serde_json::Map::new();
+    model.insert("id".into(), sel.model.id.clone().into());
+    model.insert(
+        "name".into(),
+        sel.model
+            .label
+            .clone()
+            .unwrap_or_else(|| sel.model.id.clone())
+            .into(),
+    );
+    // What the config says about the model and nothing more. An endpoint that serves no
+    // thinking levels gets `false`, so pi never sends a thinking payload it would refuse.
+    model.insert("reasoning".into(), (!sel.model.effort.is_empty()).into());
+    model.insert("input".into(), serde_json::json!(["text"]));
+    // Usage accounting only, and a price nobody gave us is not zero — it is unknown. Zeros
+    // are what pi reads as "do not price this", which is the honest answer here.
+    model.insert(
+        "cost".into(),
+        serde_json::json!({ "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }),
+    );
+    if let Some(ctx) = sel.model.context_window {
+        model.insert("contextWindow".into(), ctx.into());
+    }
+    if let Some(max) = sel.model.max_tokens {
+        model.insert("maxTokens".into(), max.into());
+    }
+
+    let mut provider = serde_json::Map::new();
+    provider.insert("name".into(), sel.provider.name.clone().into());
+    provider.insert("baseUrl".into(), url.into());
+    provider.insert("api".into(), api.as_str().into());
+    // A reference, resolved by pi per request. Without any key at all the models load and
+    // stay unselectable, so a keyless endpoint gets a placeholder the way pi's own docs
+    // prescribe for a local server.
+    provider.insert(
+        "apiKey".into(),
+        match has_token {
+            true => format!("${KEY_ENV}"),
+            false => "fastpick-keyless".to_string(),
+        }
+        .into(),
+    );
+    provider.insert("models".into(), serde_json::json!([model]));
+
+    Ok(format!(
+        "// Generated by fastpick. Rewritten at every launch, so edits here are lost.\n\
+         export default function (pi) {{\n  pi.registerProvider({}, {});\n}}\n",
+        serde_json::to_string(&sel.provider.id)?,
+        serde_json::to_string_pretty(&serde_json::Value::Object(provider))?
+    ))
+}
+
+/// Puts the source on disk and answers where it landed.
+fn write_pi_extension(route: &str, body: &str) -> Result<PathBuf> {
+    let path = pi_extension_path(route)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
 /// A TOML basic string, quotes included, with everything the grammar reserves escaped.
 ///
 /// Without this a `name` or a `base_url` holding a `"` closes the string early and the
@@ -649,6 +791,12 @@ mod tests {
             kind = "codex"
             bin = "fastpick-test-codex"
 
+            [[harness]]
+            id = "pi"
+            name = "Pi"
+            kind = "pi"
+            bin = "fastpick-test-pi"
+
             [[provider]]
             id = "acme"
             name = "Acme"
@@ -666,6 +814,10 @@ mod tests {
             base_url = "https://acme.invalid/v1"
             wire_api = "chat"
 
+            [provider.harness.pi]
+            base_url = "https://acme.invalid"
+            api = "anthropic-messages"
+
             [[provider.model]]
             id = "acme-mini"
 
@@ -674,6 +826,7 @@ mod tests {
             name = "Built in"
 
             [provider.harness.claude-code]
+            [provider.harness.pi]
 
             [[provider.model]]
             id = "claude-opus-5"
@@ -1062,6 +1215,106 @@ mod tests {
         let sel = selection_on_key(&cfg, "claude-code", "acme", Some("first"), &m);
         let err = build(&cfg, &sel).unwrap_err().to_string();
         assert!(err.contains("--set-key acme.first"), "{err}");
+    }
+
+    /// The generated extension is the whole contract with pi, so it is read rather than
+    /// trusted: the endpoint, the dialect, the one model, and a key that is a reference.
+    #[test]
+    fn pi_generates_a_provider_and_never_writes_the_key_into_it() {
+        let (_d, cfg) = fixture();
+        let mut m = Model::new("acme-large".into());
+        m.label = Some("Acme Large".into());
+        m.context_window = Some(500_000);
+        m.effort = vec!["high".into()];
+        let sel = selection(&cfg, "pi", "acme", &m);
+        let body = pi_extension_body(
+            &sel,
+            "https://acme.invalid",
+            crate::config::PiApi::AnthropicMessages,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            !body.contains("sk-test-token"),
+            "the key is referenced through the environment, never written to disk: {body}"
+        );
+        assert!(body.contains(&format!("\"${KEY_ENV}\"")));
+        assert!(body.contains("\"baseUrl\": \"https://acme.invalid\""), "{body}");
+        assert!(body.contains("\"api\": \"anthropic-messages\""), "{body}");
+        assert!(body.contains("\"id\": \"acme-large\""), "{body}");
+        assert!(body.contains("\"contextWindow\": 500000"), "{body}");
+        // Declared by nobody, so it is left out and pi keeps its own default rather than
+        // being handed an output cap this program invented.
+        assert!(!body.contains("maxTokens"), "{body}");
+        // The config gives this model an effort level, which is the only thing here that
+        // says the endpoint serves thinking at all.
+        assert!(body.contains("\"reasoning\": true"), "{body}");
+    }
+
+    #[test]
+    fn pi_declares_no_thinking_for_a_model_that_lists_no_effort() {
+        let (_d, cfg) = fixture();
+        let m = Model::new("acme-large".into());
+        let sel = selection(&cfg, "pi", "acme", &m);
+        let body = pi_extension_body(
+            &sel,
+            "https://acme.invalid",
+            crate::config::PiApi::OpenaiCompletions,
+            false,
+        )
+        .unwrap();
+        assert!(body.contains("\"reasoning\": false"), "{body}");
+        // No key at all: the models would load and stay unselectable without a placeholder.
+        assert!(body.contains("\"apiKey\": \"fastpick-keyless\""), "{body}");
+    }
+
+    /// Nothing is generated for one of pi's own providers, and no file is written either:
+    /// this is the arm the test suite can take through `build` without touching the config
+    /// directory.
+    #[test]
+    fn pi_on_a_builtin_provider_overrides_nothing() {
+        let (_d, cfg) = fixture();
+        let m = Model::new("claude-opus-5".into());
+        let sel = selection(&cfg, "pi", "builtin", &m);
+        let cmd = build(&cfg, &sel).unwrap();
+        assert_eq!(
+            args_of(&cmd),
+            vec!["--provider", "builtin", "--model", "claude-opus-5"]
+        );
+        assert!(
+            env_removed(&cmd, KEY_ENV),
+            "a value left over from an earlier launch would be handed to this endpoint"
+        );
+    }
+
+    #[test]
+    fn pi_refuses_a_base_url_it_has_no_dialect_for() {
+        let toml = r#"
+            [[harness]]
+            id = "pi"
+            name = "Pi"
+            kind = "pi"
+            bin = "fastpick-test-pi"
+
+            [[provider]]
+            id = "acme"
+            name = "Acme"
+
+            [provider.harness.pi]
+            base_url = "https://acme.invalid"
+
+            [[provider.model]]
+            id = "m"
+        "#;
+        // `validate` refuses this at load; the guard in the adapter is what a config
+        // reaching `build` by any other route still runs into.
+        let broken = Config::parse_unvalidated(toml).unwrap();
+        let m = Model::new("m".into());
+        let sel = selection(&broken, "pi", "acme", &m);
+        let err = build(&broken, &sel).unwrap_err().to_string();
+        assert!(err.contains("api"), "{err}");
+        assert!(Config::parse(toml).is_err(), "and it never loads at all");
     }
 
     #[test]
