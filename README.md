@@ -1,5 +1,5 @@
 <h1 align="center">fastpick</h1>
-<p align="center">Terminal picker for Claude Code, Codex and OpenCode: harness, provider, model, system prompts, launch.</p>
+<p align="center">Terminal picker for Claude Code, Codex, OpenCode and Pi: harness, provider, model, system prompts, launch.</p>
 
 <p align="center">
   <a href="https://github.com/beboite/fastpick/releases"><img src="https://img.shields.io/github/v/release/beboite/fastpick?display_name=tag" alt="Release" /></a>
@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/Rust-1.88%2B-CE422B?logo=rust" alt="Rust" />
 </p>
 
-Claude Code, Codex and OpenCode each want a different environment, and so does every
+Claude Code, Codex, OpenCode and Pi each want a different environment, and so does every
 endpoint you point them at, so shell wrappers duplicate that setup once per pair. Here it is
 one config file, and the model list is not config at all: it is fetched from the provider.
 
@@ -142,11 +142,20 @@ single key keeps answering to its own id everywhere, and the short form above st
 | Claude Code | environment variables | `--model` | `--append-system-prompt-file`, appends |
 | OpenCode | inline JSON in `OPENCODE_CONFIG_CONTENT` | `--model provider/model` | its `instructions` array, appends |
 | Codex | dotted TOML overrides with `-c` | `--model` | **not supported** |
+| Pi | a generated extension, loaded with `--extension` | `--provider` and `--model` | `--append-system-prompt`, appends |
 
 Nothing writes to your agents' own config files, and OpenCode's inline config is merged over
 `opencode.json` rather than replacing it. Codex gets no system prompt row because its
 instructions override replaces the base prompt, tool rules included: swapping an agent's own
 prompt for yours is not something to do quietly.
+
+Pi is the one harness with no lever for an endpoint at launch: its providers carry their own
+base url in code, and its `models.json` is your file inside its own config directory. So a
+provider with a `base_url` is written as a `pi.registerProvider` extension under fastpick's
+config directory, one file per route, rewritten at every launch and loaded with
+`--extension`. That needs the endpoint's dialect, which is `api` on the binding. The key is
+still a `$FASTPICK_PROVIDER_KEY` reference resolved at request time, so nothing generated
+holds a secret.
 
 Two Claude Code behaviours the config works around, both easy to get wrong by hand:
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` does nothing for `claude-*` models, so fastpick refuses to
