@@ -1240,7 +1240,10 @@ mod tests {
             "the key is referenced through the environment, never written to disk: {body}"
         );
         assert!(body.contains(&format!("\"${KEY_ENV}\"")));
-        assert!(body.contains("\"baseUrl\": \"https://acme.invalid\""), "{body}");
+        assert!(
+            body.contains("\"baseUrl\": \"https://acme.invalid\""),
+            "{body}"
+        );
         assert!(body.contains("\"api\": \"anthropic-messages\""), "{body}");
         assert!(body.contains("\"id\": \"acme-large\""), "{body}");
         assert!(body.contains("\"contextWindow\": 500000"), "{body}");
