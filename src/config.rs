@@ -390,6 +390,17 @@ pub struct Model {
     #[serde(default)]
     pub max_tokens: Option<u64>,
 
+    /// Wire quirks of the endpoint serving this model, for a harness that lets a caller
+    /// declare them. Only Pi does, as `compat` on the model, and the flags are its own
+    /// vocabulary: this map is passed through verbatim rather than mirrored here, because
+    /// a list of names copied from another project's release notes goes stale silently.
+    ///
+    /// It sits on the model and not on the binding because that is where the harness reads
+    /// it. Declaring it per binding would describe the endpoint more honestly and would
+    /// then have to be copied onto every model anyway.
+    #[serde(default)]
+    pub pi_compat: BTreeMap<String, bool>,
+
     #[serde(default)]
     pub effort: Vec<String>,
 
@@ -416,6 +427,7 @@ impl Model {
             context_window: None,
             compact_ratio: None,
             max_tokens: None,
+            pi_compat: BTreeMap::new(),
             effort: Vec::new(),
             effort_default: None,
             small_fast_model: None,
