@@ -44,17 +44,27 @@ first one you left out. `--key` names a credential, which names its provider too
 skips that screen as well.
 
 Up and down move, right goes forward, left goes back. On the model list Enter launches
-straight away: the matching system prompt file is already checked and the effort is the
+straight away: the system prompt the model declares is already checked and the effort is the
 model's default, so the usual case is one key. Right opens the options panel beside the
-list, where space changes whatever the cursor is on and `a` lists every file in the prompts
-folder. `tab` refetches the model list and typing filters it.
+list, where space changes whatever the cursor is on. `tab` refetches the model list and
+typing filters it.
 
-A file is matched to a model by its name: `orca-v4.md` covers `orca-v4-pro`, since a stem
-may be a prefix of the model. That breaks the moment an endpoint routes by its own scheme
-and calls the same model `acme-orca-v4-pro`, and it breaks quietly, with the file simply
-never offered. Give that model a `prompt = "orca-v4"` and matching uses the name you wrote
-rather than the id. There is no trimming rule instead of this on purpose: which part of an
-arbitrary id belongs to the endpoint is not something the code can know.
+Every `.md` in the prompts folder is offered for every model, and any of them can be ticked
+for any model. Which one starts ticked is written in the config and nowhere else:
+
+```toml
+[[provider.model]]
+id = "acme-orca-v4-pro"
+prompt = "house-style"      # the .md is optional, the case does not matter
+```
+
+Nothing is guessed from the model's name. A file used to be tied to the id it was named
+after, which meant a prompt written for a task or a house style could not be given to two
+unrelated models, a file named after nothing was invisible until a key was pressed, and an
+endpoint routing by its own scheme (`acme-orca-v4-pro` for what is upstream an
+`orca-v4-pro`) matched nothing at all, silently. Naming the file you want says it once.
+A `prompt` naming a file the folder does not hold is reported, in the panel and at launch,
+rather than dropped.
 
 ## Installing it
 

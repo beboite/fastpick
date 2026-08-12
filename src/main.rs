@@ -46,8 +46,9 @@ OPTIONS
       --model <id>       skip the model screen
       --effort <level>   effort level, when the harness takes one
       --md <file>        system prompt file, repeatable. A bare name is resolved inside the
-                         prompts folder; anything else is taken as a path
-      --no-md            launch without a system prompt even if one matches the model
+                         prompts folder; anything else is taken as a path. Replaces the one
+                         the model declares
+      --no-md            launch without a system prompt even if the model declares one
   -u, --update           install the newest signed release over this binary
   -h, --help             this text
   -V, --version          version
@@ -71,7 +72,6 @@ KEYS
   left      back             enter   launch
   space     change the row under the cursor in the options panel
   tab       refetch the model catalogue for this provider
-  a         list every file in the prompts folder, not only the ones matching the model
   type      filter the model list
 
 PATHS
@@ -414,9 +414,21 @@ fn real_main() -> Result<i32> {
     state::save(&harness.id, &provider.id, &picked.model.id);
 
     let prompts = if args.md.is_empty() && !args.no_md {
+        // Said here rather than only in the panel: every screen can be answered on the
+        // command line, and then the panel is never drawn.
+        if let Some(name) = &picked.prompt_missing {
+            let where_ = cfg
+                .prompts_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "no prompts folder".into());
+            eprintln!(
+                "fastpick: model `{}` asks for prompt `{name}`, which is not in {where_}. Launching without it.",
+                picked.model.id
+            );
+        }
         picked.prompts
     } else {
-        resolve_prompts(&cfg, &picked.model, &args)?
+        resolve_prompts(&cfg, &args)?
     };
 
     let sel = launch::Selection {
@@ -466,27 +478,14 @@ fn real_main() -> Result<i32> {
     launch::run(&cfg, &sel)
 }
 
-/// System prompt files named with `--md`, or none at all under `--no-md`.
-fn resolve_prompts(
-    cfg: &config::Config,
-    model: &config::Model,
-    args: &Args,
-) -> Result<Vec<PathBuf>> {
+/// The files `--md` names, or none at all under `--no-md`. Only ever called for one of those
+/// two flags: without them the file comes from the model's own `prompt`, which the picker
+/// has already resolved against the folder it is listing.
+fn resolve_prompts(cfg: &config::Config, args: &Args) -> Result<Vec<PathBuf>> {
     if args.no_md {
         return Ok(Vec::new());
     }
     let dir = cfg.prompts_dir();
-
-    if args.md.is_empty() {
-        let Some(dir) = dir else {
-            return Ok(Vec::new());
-        };
-        return Ok(prompts::matches_for(&dir, model.prompt_name())
-            .into_iter()
-            .take(1)
-            .map(|f| f.path)
-            .collect());
-    }
 
     let mut out = Vec::new();
     for name in &args.md {
