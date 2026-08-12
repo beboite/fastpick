@@ -653,16 +653,18 @@ impl Config {
                     ));
                 }
                 if let Some(cat) = &k.catalog {
-                    // A key on a cleartext connection is a key on the wire. Refused rather
-                    // than warned about, because a warning would scroll past inside a menu.
-                    // Loopback is the exception and not a loose one: the bytes never leave the
-                    // machine, and a local translator or a llama.cpp server is http by nature.
+                    // A key on a cleartext connection to the internet is a key on the wire.
+                    // Refused rather than warned about, because a warning would scroll past
+                    // inside a menu. This machine and the owner's own network are the
+                    // exception: a local translator, a llama.cpp server or a broker on the
+                    // LAN is http by nature, and inference already carries the same token
+                    // there on every call.
                     if cat.auth != CatalogAuth::None
                         && cat.url.starts_with("http://")
-                        && !is_loopback_url(&cat.url)
+                        && !is_private_url(&cat.url)
                     {
                         return Err(anyhow!(
-                            "{whose}: the catalogue url is http://, so the key would travel in cleartext. Use https://, or `auth = \"none\"` if the endpoint needs no key."
+                            "{whose}: the catalogue url is http:// on a public host, so the key would travel in cleartext. Use https://, or `auth = \"none\"` if the endpoint needs no key."
                         ));
                     }
                 }
@@ -800,29 +802,58 @@ pub fn config_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.toml"))
 }
 
-/// Whether a url points at this machine, so cleartext on it never reaches a network.
-fn is_loopback_url(url: &str) -> bool {
+/// The host part of a url, without the port, the userinfo or the path.
+fn host_of(url: &str) -> &str {
     let rest = match url.split_once("://") {
         Some((_, rest)) => rest,
         None => url,
     };
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(rest)
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority
         .rsplit_once('@')
         .map(|(_, h)| h)
-        .unwrap_or_else(|| rest.split(['/', '?', '#']).next().unwrap_or(rest));
-    let host = match host.strip_prefix('[') {
+        .unwrap_or(authority);
+    match host.strip_prefix('[') {
         // An IPv6 literal, `[::1]:8080`.
         Some(v6) => v6.split(']').next().unwrap_or(v6),
         None => host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host),
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host == "::1"
-        || host
-            .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    }
+}
+
+/// Whether a url stays on this machine or on a network its owner controls, so cleartext
+/// on it never crosses the internet.
+///
+/// Loopback is the obvious half. The other half is a private address, and it is here
+/// because refusing one is incoherent rather than careful: an endpoint on a home LAN is
+/// reached over http for inference too, with the same token in the same header on every
+/// single call, so refusing to *list* its models over http protects nothing while pushing
+/// the config toward `auth = "none"`, which simply fails against anything that
+/// authenticates. RFC 1918, CGNAT (which is what a tailnet uses), and link-local.
+fn is_private_url(url: &str) -> bool {
+    let host = host_of(url);
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    // A `.local` or `.internal` name is by definition not routable off the network that
+    // serves it, and resolving it here would be a DNS lookup inside config validation.
+    let lower = host.to_ascii_lowercase();
+    if lower.ends_with(".local") || lower.ends_with(".internal") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        let [a, b, ..] = ip.octets();
+        return ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            // 100.64.0.0/10, the carrier-grade NAT block a tailnet hands out.
+            || (a == 100 && (64..128).contains(&b));
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        // Loopback, unique-local (fc00::/7) and link-local (fe80::/10).
+        let s = ip.segments()[0];
+        return ip.is_loopback() || (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80;
+    }
+    false
 }
 
 /// Rejects a duplicate or empty id, naming the one that repeats.
@@ -1022,11 +1053,40 @@ mod tests {
     }
 
     #[test]
-    fn loopback_over_http_is_fine_because_it_never_reaches_a_network() {
+    fn the_private_url_test_knows_a_home_network_from_the_internet() {
         for url in [
             "http://127.0.0.1:4000/v1/models",
             "http://localhost:8080/v1/models",
             "http://[::1]:8080/v1/models",
+            "http://192.168.1.62:8787/v1/models",
+            "http://10.0.0.10/v1/models",
+            "http://172.16.4.2:8080/v1/models",
+            // The CGNAT block a tailnet hands out.
+            "http://100.64.0.9:8787/v1/models",
+            "http://broker.local/v1/models",
+            "http://user:pw@192.168.1.62:8787/v1/models",
+        ] {
+            assert!(is_private_url(url), "{url} should count as private");
+        }
+        for url in [
+            "http://models.invalid/v1/models",
+            "http://1.1.1.1/v1/models",
+            // Neighbours of the private ranges, on the public side of each edge.
+            "http://172.32.0.1/v1/models",
+            "http://100.128.0.1/v1/models",
+            "http://11.0.0.1/v1/models",
+        ] {
+            assert!(!is_private_url(url), "{url} should count as public");
+        }
+    }
+
+    #[test]
+    fn a_private_endpoint_over_http_is_fine_because_inference_already_goes_there() {
+        for url in [
+            "http://127.0.0.1:4000/v1/models",
+            "http://localhost:8080/v1/models",
+            "http://[::1]:8080/v1/models",
+            "http://192.168.1.62:8787/v1/models",
         ] {
             let cfg = parse(&format!(
                 r#"
@@ -1079,14 +1139,17 @@ mod tests {
     }
 
     #[test]
-    fn loopback_detection_does_not_take_a_lookalike_host() {
-        assert!(is_loopback_url("http://127.0.0.1:1/x"));
-        assert!(is_loopback_url("http://127.5.5.5/x"));
-        assert!(is_loopback_url("http://localhost/x"));
-        assert!(is_loopback_url("http://[::1]:80/x"));
-        assert!(!is_loopback_url("http://127.0.0.1.evil.invalid/x"));
-        assert!(!is_loopback_url("http://localhost.evil.invalid/x"));
-        assert!(!is_loopback_url("http://10.0.0.1/x"));
+    fn private_detection_does_not_take_a_lookalike_host() {
+        // A public name that merely reads like a local one is the whole reason this is
+        // parsed rather than pattern-matched.
+        assert!(is_private_url("http://127.0.0.1:1/x"));
+        assert!(is_private_url("http://127.5.5.5/x"));
+        assert!(is_private_url("http://localhost/x"));
+        assert!(is_private_url("http://[::1]:80/x"));
+        assert!(is_private_url("http://10.0.0.1/x"));
+        assert!(!is_private_url("http://127.0.0.1.evil.invalid/x"));
+        assert!(!is_private_url("http://localhost.evil.invalid/x"));
+        assert!(!is_private_url("http://10.0.0.1.evil.invalid/x"));
     }
 }
 
