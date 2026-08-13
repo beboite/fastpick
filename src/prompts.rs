@@ -1,10 +1,11 @@
-//! Matching `.md` files in the system prompts folder to the selected model.
+//! The `.md` files in the system prompts folder.
 //!
-//! The whole point of naming the files after models is that no flag has to be typed:
-//! pick `orca-v4-pro` and `orca-v4.md` is already proposed. Matching is on the
-//! file stem, case-insensitively, and is deliberately loose in one direction only:
-//! a stem may be a prefix of the model name (`orca-v4` covers `orca-v4-pro`),
-//! so one file can serve a whole family without being copied per variant.
+//! Nothing is guessed from the model's name. Every file in the folder is offered for every
+//! model, and a model gets a file checked for it only by naming one in `prompt`. Guessing
+//! used to mean a file was tied to the id it was named after: one prompt could not serve two
+//! unrelated models, a file named after nothing was invisible until a key was pressed, and
+//! an endpoint routing by its own scheme silently matched nothing at all. A name written in
+//! the config says what was meant, and says it once.
 
 use std::path::{Path, PathBuf};
 
@@ -12,12 +13,9 @@ use std::path::{Path, PathBuf};
 pub struct PromptFile {
     pub path: PathBuf,
     pub stem: String,
-    /// Length of the matched prefix. Longer means more specific, so it sorts first.
-    pub score: usize,
 }
 
-/// Every `.md` in the folder, sorted by name. Used for the "show all" view, where a file
-/// that matches nothing is still selectable by hand.
+/// Every `.md` in the folder, sorted by name. This is the whole list a model is offered.
 pub fn all_in(dir: &Path) -> Vec<PromptFile> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -35,39 +33,29 @@ pub fn all_in(dir: &Path) -> Vec<PromptFile> {
         .filter_map(|e| {
             let path = e.path();
             let stem = path.file_stem()?.to_string_lossy().to_string();
-            Some(PromptFile {
-                path,
-                stem,
-                score: 0,
-            })
+            Some(PromptFile { path, stem })
         })
         .collect();
     out.sort_by_key(|p| p.stem.to_lowercase());
     out
 }
 
-/// The files that match `model`, most specific first.
-pub fn matches_for(dir: &Path, model: &str) -> Vec<PromptFile> {
-    let model = model.to_lowercase();
-    let mut out: Vec<PromptFile> = all_in(dir)
+/// The file a name refers to, or nothing when the folder holds no such file.
+///
+/// The name comes from a model's `prompt` or from `--md`, both hand-written, so the
+/// extension is optional and the case does not have to be reproduced: `Orca-V4`, `orca-v4`
+/// and `orca-v4.md` are the same file. Nothing else is tried, and a name matching no file is
+/// the caller's to report: guessing here is what this module stopped doing.
+pub fn find(dir: &Path, name: &str) -> Option<PromptFile> {
+    // Split on the last dot rather than trimming three bytes, so `nova-4.5` keeps its own
+    // dot and a name ending in a multi-byte character cannot be cut mid-character.
+    let name = match name.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("md") => stem,
+        _ => name,
+    };
+    all_in(dir)
         .into_iter()
-        .filter_map(|mut f| {
-            let stem = f.stem.to_lowercase();
-            if stem == model {
-                f.score = usize::MAX;
-                return Some(f);
-            }
-            // A stem covering a family: `orca-v4` for `orca-v4-pro`. The dash is
-            // required so `zeta-5` does not claim `zeta-52` if such a name ever appears.
-            if model.starts_with(&format!("{stem}-")) {
-                f.score = stem.len();
-                return Some(f);
-            }
-            None
-        })
-        .collect();
-    out.sort_by(|a, b| b.score.cmp(&a.score).then(a.stem.cmp(&b.stem)));
-    out
+        .find(|f| f.stem.eq_ignore_ascii_case(name))
 }
 
 #[cfg(test)]
@@ -83,29 +71,26 @@ mod tests {
     }
 
     #[test]
-    fn exact_name_wins_over_family_prefix() {
-        let dir = fixture(&["orca-v4.md", "orca-v4-pro.md", "nova-4.5.md"]);
-        let hits = matches_for(dir.path(), "orca-v4-pro");
-        assert_eq!(hits[0].stem, "orca-v4-pro");
-        assert_eq!(hits[1].stem, "orca-v4");
-        assert_eq!(hits.len(), 2);
+    fn every_file_in_the_folder_is_listed_whatever_it_is_called() {
+        let dir = fixture(&["orca-v4.md", "house-style.md", "nova-4.5.md"]);
+        let names: Vec<String> = all_in(dir.path()).into_iter().map(|f| f.stem).collect();
+        assert_eq!(names, ["house-style", "nova-4.5", "orca-v4"]);
     }
 
     #[test]
-    fn a_family_file_covers_its_variants() {
+    fn a_name_finds_its_file_with_or_without_the_extension() {
+        let dir = fixture(&["orca-v4.md", "nova-4.5.md"]);
+        assert_eq!(find(dir.path(), "orca-v4").unwrap().stem, "orca-v4");
+        assert_eq!(find(dir.path(), "orca-v4.md").unwrap().stem, "orca-v4");
+        assert_eq!(find(dir.path(), "Orca-V4").unwrap().stem, "orca-v4");
+    }
+
+    #[test]
+    fn a_name_no_file_carries_is_not_guessed_at() {
         let dir = fixture(&["orca-v4.md"]);
-        assert_eq!(matches_for(dir.path(), "orca-v4-pro").len(), 1);
-        assert_eq!(matches_for(dir.path(), "orca-v4-flash").len(), 1);
-        // A different family must not be caught by it.
-        assert!(matches_for(dir.path(), "orca-v3.2").is_empty());
-    }
-
-    #[test]
-    fn the_dash_is_required_so_neighbours_do_not_collide() {
-        let dir = fixture(&["zeta-5.md"]);
-        assert_eq!(matches_for(dir.path(), "zeta-5-air").len(), 1);
-        // `zeta-5.2` is a different model, not a variant of `zeta-5`.
-        assert!(matches_for(dir.path(), "zeta-5.2").is_empty());
+        // The prefix rule this replaced would have answered `orca-v4.md` here.
+        assert!(find(dir.path(), "orca-v4-pro").is_none());
+        assert!(find(dir.path(), "orca").is_none());
     }
 
     #[test]
@@ -117,7 +102,7 @@ mod tests {
     #[test]
     fn a_missing_folder_is_empty_not_an_error() {
         assert!(all_in(std::path::Path::new("no/such/folder")).is_empty());
-        assert!(matches_for(std::path::Path::new("no/such/folder"), "x").is_empty());
+        assert!(find(std::path::Path::new("no/such/folder"), "x").is_none());
     }
 }
 

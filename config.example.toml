@@ -38,7 +38,8 @@
 # The two shapes cannot be mixed: a provider declaring keys is refused if it also leaves a
 # route field on itself, naming the field to move.
 
-# Where the .md files offered as system prompts live. Left commented on purpose: unset, it
+# Where the .md files offered as system prompts live. Every file in here is offered for every
+# model; a model picks its own with `prompt` below. Left commented on purpose: unset, it
 # is `system-prompts` next to this file, which is the folder the first run just created,
 # and that path is right on every platform. Writing `~/.config/fastpick/system-prompts`
 # here would be wrong on Windows, where this file lives under %APPDATA%.
@@ -179,12 +180,11 @@ small_fast_model = "example-small"
   context_window = 1000000
   compact_ratio = 0.9
   # small_fast_model = "example-tiny"   overrides the provider's, for this model only
-  # System prompt files are matched against the id, so an endpoint routing by its own
-  # scheme (`example-orca-v4-pro` for what is upstream an `orca-v4-pro`) matches nothing and
-  # the file is silently never offered. Name the model here and matching uses this instead.
-  # No trimming rule could do it for you: which half of an id is the endpoint's is a fact
-  # only the config knows.
-  # prompt = "orca-v4"
+  # The system prompt this model launches with, named as the file sits in the prompts folder
+  # and with the `.md` optional. Nothing is guessed from the id: any model can take any file,
+  # several models can name the same one, and a file nobody names is still one keypress away
+  # in the options panel. Unset, the model launches with no system prompt.
+  # prompt = "house-style"
 
   # Anything the adapters do not cover, per provider or per binding. Values are passed to
   # the agent as written.

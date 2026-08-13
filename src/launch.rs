@@ -630,6 +630,13 @@ fn pi_extension_body(
     if let Some(max) = sel.model.max_tokens {
         model.insert("maxTokens".into(), max.into());
     }
+    // Passed through verbatim, and on the model rather than on the provider: pi reads the
+    // provider-level object for other purposes and a wire quirk declared there alone has no
+    // effect on the request, which fails as a 400 from the endpoint with nothing local to
+    // point at.
+    if !sel.model.pi_compat.is_empty() {
+        model.insert("compat".into(), serde_json::json!(sel.model.pi_compat));
+    }
 
     let mut provider = serde_json::Map::new();
     provider.insert("name".into(), sel.provider.name.clone().into());
@@ -1253,6 +1260,50 @@ mod tests {
         // The config gives this model an effort level, which is the only thing here that
         // says the endpoint serves thinking at all.
         assert!(body.contains("\"reasoning\": true"), "{body}");
+    }
+
+    /// The wire quirks go on the model, which is the only place pi reads them: the same
+    /// object on the provider is accepted and changes nothing about the request.
+    #[test]
+    fn pi_puts_the_declared_compat_flags_on_the_model() {
+        let (_d, cfg) = fixture();
+        let mut m = Model::new("acme-large".into());
+        m.pi_compat
+            .insert("supportsEagerToolInputStreaming".into(), false);
+        let sel = selection(&cfg, "pi", "acme", &m);
+        let body = pi_extension_body(
+            &sel,
+            "https://acme.invalid",
+            crate::config::PiApi::AnthropicMessages,
+            true,
+        )
+        .unwrap();
+
+        let model = body
+            .split("\"models\":")
+            .nth(1)
+            .expect("the generated provider declares its models");
+        assert!(
+            model.contains("\"supportsEagerToolInputStreaming\": false"),
+            "{body}"
+        );
+    }
+
+    /// A model that declares none gets no `compat` key at all, rather than an empty object
+    /// pi would have to interpret.
+    #[test]
+    fn pi_omits_compat_when_the_config_declares_none() {
+        let (_d, cfg) = fixture();
+        let m = Model::new("acme-large".into());
+        let sel = selection(&cfg, "pi", "acme", &m);
+        let body = pi_extension_body(
+            &sel,
+            "https://acme.invalid",
+            crate::config::PiApi::AnthropicMessages,
+            true,
+        )
+        .unwrap();
+        assert!(!body.contains("compat"), "{body}");
     }
 
     #[test]

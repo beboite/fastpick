@@ -27,7 +27,9 @@ use crate::prompts;
 /// 3: a provider reports its keys. `needsKey`, `keyPresent`, `harnesses`, `proxyPort` and
 /// `hostCheck` moved off the provider and onto each key, because a provider holding two
 /// subscriptions answers those questions differently for each of them.
-pub const SCHEMA: u32 = 3;
+/// 4: a model's `prompts` list became a single `prompt`. Files are no longer matched against
+/// the id, so there is no list of candidates to rank, only the one file the config named.
+pub const SCHEMA: u32 = 4;
 
 /// Environment variables whose value is a credential. Matched by exact name, never by
 /// substring: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` also contains `TOKEN`, and hiding a context
@@ -176,8 +178,10 @@ struct ModelView {
     context_window: Option<u64>,
     effort: Vec<String>,
     effort_default: Option<String>,
-    /// System prompt files matching this model, most specific first, as `--md` names.
-    prompts: Vec<String>,
+    /// The system prompt file this model launches with, as an `--md` name. Absent when the
+    /// model names none, or names one the folder does not hold: either way nothing is
+    /// appended, and the caller reading this is told the same thing the picker shows.
+    prompt: Option<String>,
 }
 
 impl From<&Source> for SourceView {
@@ -285,15 +289,11 @@ pub fn listing(
                             context_window: m.context_window,
                             effort: m.effort.clone(),
                             effort_default: m.effort_default.clone(),
-                            prompts: dir
+                            prompt: dir
                                 .as_ref()
-                                .map(|d| {
-                                    prompts::matches_for(d, m.prompt_name())
-                                        .into_iter()
-                                        .map(|f| f.stem)
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
+                                .zip(m.prompt_file())
+                                .and_then(|(d, name)| prompts::find(d, name))
+                                .map(|f| f.stem),
                         }
                     })
                     .collect(),
@@ -487,6 +487,7 @@ mod tests {
             [[provider.model]]
             id = "orca-v4-pro"
             context_window = 1000000
+            prompt = "orca-v4"
 
             [[provider]]
             id = "builtin"
@@ -652,11 +653,12 @@ mod tests {
     }
 
     #[test]
-    fn a_model_carries_the_prompt_files_that_match_it() {
+    fn a_model_carries_the_prompt_file_it_named_and_the_folder_carries_the_rest() {
         let (_d, v) = listing_json(Some("acme"));
         let items = v["models"]["items"].as_array().unwrap();
-        // `orca-v4.md` covers the family, `nova-4.5.md` is a different one.
-        assert_eq!(items[0]["prompts"], serde_json::json!(["orca-v4"]));
+        // The model declared `orca-v4`; `nova-4.5.md` is in the folder and belongs to
+        // nobody, which no longer keeps it out of anything.
+        assert_eq!(items[0]["prompt"], "orca-v4");
         assert_eq!(v["prompts"].as_array().unwrap().len(), 2);
     }
 

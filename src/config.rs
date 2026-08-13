@@ -390,6 +390,17 @@ pub struct Model {
     #[serde(default)]
     pub max_tokens: Option<u64>,
 
+    /// Wire quirks of the endpoint serving this model, for a harness that lets a caller
+    /// declare them. Only Pi does, as `compat` on the model, and the flags are its own
+    /// vocabulary: this map is passed through verbatim rather than mirrored here, because
+    /// a list of names copied from another project's release notes goes stale silently.
+    ///
+    /// It sits on the model and not on the binding because that is where the harness reads
+    /// it. Declaring it per binding would describe the endpoint more honestly and would
+    /// then have to be copied onto every model anyway.
+    #[serde(default)]
+    pub pi_compat: BTreeMap<String, bool>,
+
     #[serde(default)]
     pub effort: Vec<String>,
 
@@ -399,11 +410,10 @@ pub struct Model {
     #[serde(default)]
     pub small_fast_model: Option<String>,
 
-    /// What to match system prompt files against, when the id is not the model's own name.
-    /// An endpoint that routes by its own scheme serves `acme-orca-v4-pro` for what is
-    /// upstream an `orca-v4-pro`, and the file named after the model then matches nothing.
-    /// Naming the model here is the only honest fix: no amount of trimming can tell which
-    /// part of an arbitrary id is the endpoint's and which is the model's.
+    /// The system prompt file this model starts with, named as it sits in the prompts folder
+    /// and with the `.md` optional. Any model can take any file, and several models can name
+    /// the same one: nothing about the file's name has to resemble the model's. Left unset,
+    /// the model starts with no prompt checked and the folder is still there to pick from.
     #[serde(default)]
     pub prompt: Option<String>,
 }
@@ -416,6 +426,7 @@ impl Model {
             context_window: None,
             compact_ratio: None,
             max_tokens: None,
+            pi_compat: BTreeMap::new(),
             effort: Vec::new(),
             effort_default: None,
             small_fast_model: None,
@@ -427,20 +438,11 @@ impl Model {
         self.label.as_deref().unwrap_or(&self.id)
     }
 
-    /// The model name with any window suffix removed, e.g. `claude-opus-5[1m]` becomes
-    /// `claude-opus-5`.
-    pub fn base_name(&self) -> &str {
-        match self.id.find('[') {
-            Some(i) => &self.id[..i],
-            None => &self.id,
-        }
-    }
-
-    /// What system prompt files are matched against: `prompt` when the config gives one,
-    /// the id without its window suffix otherwise. Every prompt lookup goes through this,
-    /// so a model declaring `prompt` is offered the same file wherever it is served from.
-    pub fn prompt_name(&self) -> &str {
-        self.prompt.as_deref().unwrap_or_else(|| self.base_name())
+    /// The prompt file this model asked for, if it asked for one. The only thing that binds
+    /// a file to a model: no fallback on the id, because a name that happens to look like a
+    /// model's is a coincidence the config never declared.
+    pub fn prompt_file(&self) -> Option<&str> {
+        self.prompt.as_deref()
     }
 }
 
@@ -1416,7 +1418,7 @@ mod key_tests {
     }
 
     #[test]
-    fn a_model_says_which_prompt_file_it_wants_when_the_id_cannot() {
+    fn a_prompt_file_is_bound_to_a_model_only_by_the_config_saying_so() {
         let cfg = Config::parse(
             r#"
             [[harness]]
@@ -1433,7 +1435,7 @@ mod key_tests {
 
             [[provider.model]]
             id = "acme-orca-v4-pro"
-            prompt = "orca-v4"
+            prompt = "house-style"
 
             [[provider.model]]
             id = "orca-v4-pro[1m]"
@@ -1442,14 +1444,14 @@ mod key_tests {
         .unwrap();
         let models = &cfg.providers[0].keys[0].models;
         assert_eq!(
-            models[0].prompt_name(),
-            "orca-v4",
-            "an id carrying the endpoint's own prefix matches nothing on its own"
+            models[0].prompt_file(),
+            Some("house-style"),
+            "the file a model names has nothing to do with its id"
         );
         assert_eq!(
-            models[1].prompt_name(),
-            "orca-v4-pro",
-            "without `prompt` it is still the id minus the window suffix"
+            models[1].prompt_file(),
+            None,
+            "an id that looks like a file's name still claims no file"
         );
     }
 }

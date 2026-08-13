@@ -35,6 +35,11 @@ pub struct Picked {
     pub model: Model,
     pub effort: Option<String>,
     pub prompts: Vec<PathBuf>,
+    /// The `prompt` this model declares, when the folder holds no such file. Carried out of
+    /// the picker because the command line can answer every screen: nobody would have seen
+    /// the panel say it, and a launch missing its system prompt looks like a launch that
+    /// never asked for one.
+    pub prompt_missing: Option<String>,
 }
 
 /// Where the menu should open.
@@ -88,15 +93,19 @@ pub struct App<'a> {
     model_idx: usize,
 
     prompt_files: Vec<PromptFile>,
-    prompt_matches: usize,
-    prompt_show_all: bool,
+    /// The row holding the file the model's `prompt` names, so the list can say which one
+    /// was checked without the user having to remember what the config says.
+    prompt_default: Option<usize>,
+    /// A `prompt` naming a file the folder does not hold. Said out loud rather than ignored:
+    /// a typo there used to end as a prompt silently never appended.
+    prompt_missing: Option<String>,
     checked: BTreeSet<usize>,
 
     efforts: Vec<String>,
     effort_idx: Option<usize>,
 
     /// The options panel, opened next to the model list rather than after it. Enter on a
-    /// model launches with what was detected, so tuning is a detour and never a step.
+    /// model launches with what the config declared, so tuning is a detour and never a step.
     options_open: bool,
     /// Which model the current options were computed for, so closing and reopening the
     /// panel does not throw away what was ticked by hand.
@@ -151,8 +160,8 @@ impl<'a> App<'a> {
             filter: String::new(),
             model_idx: 0,
             prompt_files: Vec::new(),
-            prompt_matches: 0,
-            prompt_show_all: false,
+            prompt_default: None,
+            prompt_missing: None,
             checked: BTreeSet::new(),
             efforts: Vec::new(),
             effort_idx: None,
@@ -405,14 +414,14 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Loads the prompt files for the selected model and pre-checks the best match.
+    /// Loads the prompts folder and pre-checks the file the model named, if it named one.
     pub fn enter_options(&mut self) {
         self.options_model = self.model().map(|m| m.id.clone());
         self.opt_row = 0;
         self.checked.clear();
-        self.prompt_show_all = false;
         self.prompt_files.clear();
-        self.prompt_matches = 0;
+        self.prompt_default = None;
+        self.prompt_missing = None;
         self.unsupported.clear();
 
         let kind = self.harness().kind;
@@ -447,55 +456,26 @@ impl<'a> App<'a> {
             return;
         };
         let Some(model) = self.model() else { return };
-        let base = model.prompt_name().to_string();
+        let wanted = model.prompt_file().map(str::to_string);
 
-        let matches = prompts::matches_for(&dir, &base);
-        self.prompt_matches = matches.len();
-        self.prompt_files = matches;
-        if !self.prompt_files.is_empty() {
-            self.checked.insert(0);
-        }
-    }
-
-    fn toggle_show_all(&mut self) {
-        if !self.harness().kind.supports_system_prompts() {
-            return;
-        }
-        let Some(dir) = self.cfg.prompts_dir() else {
-            return;
-        };
-        let Some(model) = self.model() else { return };
-        let base = model.prompt_name().to_string();
-
-        self.prompt_show_all = !self.prompt_show_all;
-        let previously: Vec<PathBuf> = self
-            .checked
-            .iter()
-            .filter_map(|&i| self.prompt_files.get(i).map(|f| f.path.clone()))
-            .collect();
-
-        let matches = prompts::matches_for(&dir, &base);
-        self.prompt_matches = matches.len();
-        if self.prompt_show_all {
-            let mut all = matches.clone();
-            for f in prompts::all_in(&dir) {
-                if !all.iter().any(|m| m.path == f.path) {
-                    all.push(f);
+        // The whole folder, every time. A file is offered for a model it was never named
+        // after because that is the only way a prompt written for a family, a task or a
+        // house style can reach the model serving it.
+        self.prompt_files = prompts::all_in(&dir);
+        if let Some(wanted) = wanted {
+            match prompts::find(&dir, &wanted) {
+                Some(hit) => {
+                    self.prompt_default = self.prompt_files.iter().position(|f| f.path == hit.path)
                 }
+                None => self.prompt_missing = Some(wanted),
             }
-            self.prompt_files = all;
-        } else {
-            self.prompt_files = matches;
         }
-
-        self.checked = self
-            .prompt_files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| previously.contains(&f.path))
-            .map(|(i, _)| i)
-            .collect();
-        self.opt_row = self.opt_row.min(self.rows().saturating_sub(1));
+        if let Some(i) = self.prompt_default {
+            self.checked.insert(i);
+            // The cursor lands on the file that is already ticked, so unticking it is one
+            // key rather than a scroll through a folder of unrelated names.
+            self.opt_row = self.effort_rows() + i;
+        }
     }
 
     /// Row 0 is the effort selector when there is one, the prompt list follows.
@@ -536,6 +516,7 @@ impl<'a> App<'a> {
                 .iter()
                 .filter_map(|&i| self.prompt_files.get(i).map(|f| f.path.clone()))
                 .collect(),
+            prompt_missing: self.prompt_missing.clone(),
         })
     }
 
@@ -740,7 +721,6 @@ fn event_loop(
                 // One key acts on the current row whatever it holds, which leaves
                 // left and right to mean back and forward on every screen.
                 KeyCode::Char(' ') | KeyCode::Right => app.act_on_row(),
-                KeyCode::Char('a') => app.toggle_show_all(),
                 KeyCode::Enter => return Ok(app.picked()),
                 _ => {}
             },
@@ -768,8 +748,8 @@ fn event_loop(
                     }
                 }
                 // Enter launches from here. What the panel would have shown is already
-                // decided: the matching prompt file is checked and the effort is the
-                // model's default, so the common case is one key.
+                // decided: the prompt file the model declares is checked and the effort is
+                // its default, so the common case is one key.
                 KeyCode::Enter => {
                     if app.model().is_some() {
                         app.ensure_options();
@@ -1064,9 +1044,6 @@ fn title(app: &App) -> Line<'static> {
             "options",
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
-        if app.prompt_show_all {
-            spans.push(dim("   every file".to_string()));
-        }
     } else if app.screen == Screen::Model && !app.filter.is_empty() {
         spans.push(dim(format!("   /{}", app.filter)));
     }
@@ -1327,7 +1304,7 @@ fn options_body(app: &App) -> Body {
         rows.push(Row::Item(Line::from(spans)));
     }
 
-    if !app.prompt_files.is_empty() {
+    if !app.prompt_files.is_empty() || app.prompt_missing.is_some() {
         if !rows.is_empty() {
             rows.push(Row::Gap);
         }
@@ -1339,21 +1316,23 @@ fn options_body(app: &App) -> Body {
         } else {
             "[ ] "
         };
-        let matched = i < app.prompt_matches;
         let mut spans = vec![
             Span::styled(mark, Style::new().fg(Color::Green)),
-            Span::styled(
-                format!("{}.md", file.stem),
-                match matched {
-                    true => Style::new(),
-                    false => Style::new().fg(Color::DarkGray),
-                },
-            ),
+            Span::raw(format!("{}.md", file.stem)),
         ];
-        if matched {
-            spans.push(dim("   matches this model".to_string()));
+        if app.prompt_default == Some(i) {
+            spans.push(dim("   this model's own".to_string()));
         }
         rows.push(Row::Item(Line::from(spans)));
+    }
+
+    // Under the list rather than in place of it: the file is missing, the others are still
+    // there to pick from, and the line has to be visible while picking one.
+    if let Some(name) = &app.prompt_missing {
+        rows.push(Row::Item(Line::from(Span::styled(
+            format!("this model asks for `{name}`, which is not in the folder"),
+            Style::new().fg(Color::Yellow),
+        ))));
     }
 
     if rows.is_empty() {
@@ -1369,7 +1348,7 @@ fn options_body(app: &App) -> Body {
                 .map(|d| d.display().to_string())
                 .unwrap_or_else(|| "not configured".into());
             text.push_str(&format!(
-                "No system prompt file matches this model.\nDrop a .md named after it in {dir}, or press `a` to list every file there.\n"
+                "No system prompt to offer.\nDrop a .md in {dir} and every model can be launched with it.\n"
             ));
         }
         text.push_str("Enter launches.");
@@ -1422,6 +1401,119 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// A config whose prompts folder holds `files`, on a harness that takes system prompts.
+    /// The binary does not exist, so the caller forces harness 0 the way `--harness` does.
+    fn prompts_cfg(files: &[&str]) -> (crate::prompts::tempdir::TempDir, Config) {
+        let dir = crate::prompts::tempdir::TempDir::new();
+        let folder = dir.path().join("system-prompts");
+        std::fs::create_dir_all(&folder).unwrap();
+        for f in files {
+            std::fs::write(folder.join(f), "x").unwrap();
+        }
+        let folder = folder.display().to_string().replace('\\', "/");
+
+        let cfg = Config::parse(&format!(
+            r#"
+            system_prompts_dir = "{folder}"
+
+            [[harness]]
+            id = "claude-code"
+            name = "Claude Code"
+            kind = "claude-code"
+            bin = "fastpick-test-claude"
+
+            [[provider]]
+            id = "acme"
+            name = "Acme"
+            [provider.harness.claude-code]
+            base_url = "https://acme.invalid"
+
+            [[provider.model]]
+            id = "listed-so-the-provider-parses"
+            "#
+        ))
+        .unwrap();
+        (dir, cfg)
+    }
+
+    /// The folder is the menu. A file named after nothing in particular is offered for a
+    /// model that never heard of it, which is the whole point of dropping the matching.
+    #[test]
+    fn every_file_in_the_folder_is_offered_whatever_the_model_is() {
+        let (_d, cfg) = prompts_cfg(&["house-style.md", "orca-v4.md"]);
+        let mut app = App::new(&cfg, &Start::default());
+        app.force_harness(0);
+        app.rebuild_providers();
+        app.set_screen(Screen::Model);
+        app.models = vec![listed("nothing-like-those")];
+        app.rebuild_models();
+        app.enter_options();
+
+        let names: Vec<&str> = app.prompt_files.iter().map(|f| f.stem.as_str()).collect();
+        assert_eq!(names, ["house-style", "orca-v4"]);
+        assert!(
+            app.checked.is_empty(),
+            "a model naming no file launches without one"
+        );
+    }
+
+    /// `prompt` is the only thing that ticks a box, and it ticks any file in the folder.
+    #[test]
+    fn the_file_a_model_names_is_the_one_that_starts_checked() {
+        let (_d, cfg) = prompts_cfg(&["house-style.md", "orca-v4.md"]);
+        let mut app = App::new(&cfg, &Start::default());
+        app.force_harness(0);
+        app.rebuild_providers();
+        app.set_screen(Screen::Model);
+        let mut m = Model::new("nothing-like-those".into());
+        m.prompt = Some("house-style".into());
+        app.models = vec![Listed {
+            key: 0,
+            key_label: None,
+            model: m,
+        }];
+        app.rebuild_models();
+        app.enter_options();
+
+        assert_eq!(app.prompt_default, Some(0));
+        assert_eq!(app.checked.iter().copied().collect::<Vec<_>>(), [0]);
+        assert_eq!(
+            app.picked().unwrap().prompts.len(),
+            1,
+            "and it is what Enter launches with"
+        );
+    }
+
+    /// A typo in `prompt` used to end as a launch quietly missing its system prompt.
+    #[test]
+    fn a_prompt_the_folder_does_not_hold_is_said_on_screen() {
+        let (_d, cfg) = prompts_cfg(&["house-style.md"]);
+        let mut app = App::new(&cfg, &Start::default());
+        app.force_harness(0);
+        app.rebuild_providers();
+        app.set_screen(Screen::Model);
+        let mut m = Model::new("m".into());
+        m.prompt = Some("hosue-style".into());
+        app.models = vec![Listed {
+            key: 0,
+            key_label: None,
+            model: m,
+        }];
+        app.rebuild_models();
+        app.enter_options();
+        app.options_open = true;
+
+        assert_eq!(app.prompt_missing.as_deref(), Some("hosue-style"));
+        assert!(app.checked.is_empty());
+        assert!(render(&app).contains("hosue-style"));
+        // And it leaves the picker, because a launch answered entirely on the command line
+        // never draws the panel that just said it.
+        assert_eq!(
+            app.picked().unwrap().prompt_missing.as_deref(),
+            Some("hosue-style")
+        );
     }
 
     /// Prints a screen as the terminal would draw it, from any config file:
@@ -1713,7 +1805,6 @@ mod tests {
         app.prompt_files = vec![PromptFile {
             path: "some.md".into(),
             stem: "some".into(),
-            score: 0,
         }];
         app.checked.clear();
         app.act_on_row();
