@@ -59,23 +59,33 @@ enum Spin {
     Rest,
     /// Winding up to full speed, and holding there until told where to stop.
     Free,
+    /// Told where to stop, still running: it holds full speed until its row comes round
+    /// close enough that the brake can take it without the drum lurching.
+    Arming,
     /// Easing into the row it was given, overshooting it and settling back.
     Braking,
     Stopped,
 }
 
-/// Rows a drum crosses per second at full tilt. Fast enough that the names blur into
-/// symbols, slow enough that the eye still reads it as a wheel and not as noise.
-const TOP_SPEED: f64 = 24.0;
+/// Rows a drum crosses per second at full tilt. Slow enough that a name on the payline is
+/// still read as a name: a machine spinning too fast to see what is on it is a progress bar.
+const TOP_SPEED: f64 = 11.0;
 /// Rows per second it drifts at while waiting to be played.
 const REST_SPEED: f64 = 1.1;
 /// Rows per second squared on the way up. A drum that reaches full speed instantly has no
 /// weight, and weight is most of what makes a spin look real.
-const SPIN_UP: f64 = 46.0;
-/// Above this the drum shows casino symbols instead of names: nothing is readable at speed,
-/// and pretending otherwise is what made the old machine look like a list being replaced.
-const BLUR_SPEED: f64 = 9.0;
-/// What a blurred drum shows. Three cells wide at most, so a narrow cabinet keeps them.
+const SPIN_UP: f64 = 26.0;
+/// Above this the drum counts as running, which only changes how it is coloured. It never
+/// changes what it shows: the whole point of turning is watching the names go by.
+const BLUR_SPEED: f64 = 5.0;
+/// Rows the landing runs over. Six is about a second at full tilt: long enough to follow
+/// the last names in, short enough that three drums stopping is not a wait.
+const BRAKE_ROWS: f64 = 6.0;
+/// How much faster than its average a `settle` curve leaves, which is fixed by its shape.
+/// The landing is timed against it so the drum enters the brake at the speed it was turning.
+const ENTRY_SLOPE: f64 = 3.35;
+/// What a reel with no answer yet turns on. Three cells wide at most, so a narrow cabinet
+/// keeps them.
 const SYMBOLS: [&str; 6] = ["7 7 7", "$ $ $", "* * *", "B A R", "- - -", "$ 7 $"];
 
 /// One column of the machine. `items` is what it can land on, `offset` where it is right
@@ -93,6 +103,8 @@ pub struct Reel {
     dist: f64,
     t: f64,
     dur: f64,
+    /// The row it has been told to land on, once it has been told.
+    target: usize,
     /// Seconds of landing flash left. The drum hitting its stop is the payout of the spin.
     flash: f64,
 }
@@ -108,6 +120,7 @@ impl Reel {
             state: Spin::Rest,
             from: 0.0,
             dist: 0.0,
+            target: 0,
             t: 0.0,
             dur: 0.0,
             flash: 0.0,
@@ -130,21 +143,32 @@ impl Reel {
         self.flash = 0.0;
     }
 
-    /// Bring it down onto `row`, after `laps` more turns so the stop is watched rather than
-    /// noticed. Ignored unless the drum is actually free, which is what keeps a second call
-    /// from restarting a brake already under way.
-    pub fn brake_to(&mut self, row: usize, laps: f64) {
+    /// Tell it where to land. It keeps running until its row is `BRAKE_ROWS` away and only
+    /// then eases in, so the stop is always the same length whatever the list holds and the
+    /// drum never has to jump to cover the distance. Ignored unless the drum is actually
+    /// free, which is what keeps a second call from restarting a stop already under way.
+    pub fn brake_to(&mut self, row: usize) {
         if self.state != Spin::Free {
             return;
         }
+        self.target = row;
+        self.state = Spin::Arming;
+    }
+
+    /// Start the landing from wherever the drum is now. The travel is padded with whole
+    /// turns until it is long enough to be seen, which matters on a three-row reel.
+    fn land(&mut self) {
         let n = self.items.len().max(1) as f64;
-        let ahead = (row as f64 - self.offset).rem_euclid(n);
+        let mut dist = (self.target as f64 - self.offset).rem_euclid(n);
+        while dist < BRAKE_ROWS {
+            dist += n;
+        }
         self.from = self.offset;
-        self.dist = ahead + laps * n;
+        self.dist = dist;
         self.t = 0.0;
-        // Long enough for the eye to follow the last few rows in, and scaled by the distance
-        // so a long brake is not a slow one.
-        self.dur = (0.55 + self.dist / TOP_SPEED).min(2.2);
+        // Timed so the curve leaves at the speed the drum is already turning: any shorter
+        // and the brake starts with a lurch, which is the one thing a heavy wheel never does.
+        self.dur = dist * ENTRY_SLOPE / TOP_SPEED;
         self.state = Spin::Braking;
     }
 
@@ -162,6 +186,18 @@ impl Reel {
             Spin::Free => {
                 self.speed = (self.speed + SPIN_UP * dt).min(TOP_SPEED);
                 self.offset = (self.offset + self.speed * dt).rem_euclid(n);
+                false
+            }
+            Spin::Arming => {
+                self.speed = (self.speed + SPIN_UP * dt).min(TOP_SPEED);
+                self.offset = (self.offset + self.speed * dt).rem_euclid(n);
+                // Only once it is at speed, otherwise a drum told where to go on its first
+                // frame would land before it ever looked like it was turning.
+                if self.speed >= TOP_SPEED
+                    && (self.target as f64 - self.offset).rem_euclid(n) <= BRAKE_ROWS
+                {
+                    self.land();
+                }
                 false
             }
             Spin::Braking => {
@@ -196,17 +232,15 @@ impl Reel {
         (self.offset.round() as isize).rem_euclid(self.items.len().max(1) as isize) as usize
     }
 
-    /// What sits `offset` rows off the payline, as the eye would see it: names when the drum
-    /// is slow enough to read, symbols when it is not.
+    /// What sits `offset` rows off the payline. Always the drum's own items, at rest and at
+    /// speed alike: swapping in symbols while it runs hides the one thing worth watching,
+    /// which is the list of answers going past.
     fn face(&self, offset: isize) -> &str {
         if self.items.is_empty() {
             return "";
         }
         let i = self.offset.floor() as isize + offset;
-        match self.speed > BLUR_SPEED {
-            true => SYMBOLS[i.rem_euclid(SYMBOLS.len() as isize) as usize],
-            false => &self.items[i.rem_euclid(self.items.len() as isize) as usize],
-        }
+        &self.items[i.rem_euclid(self.items.len() as isize) as usize]
     }
 }
 
@@ -215,7 +249,7 @@ impl Reel {
 fn settle(x: f64) -> f64 {
     // A back-out curve. The overshoot is deliberately under a row, so the drum is seen to
     // strain past its stop rather than to skip one.
-    const OVERSHOOT: f64 = 1.30;
+    const OVERSHOOT: f64 = ENTRY_SLOPE - 3.0;
     let u = x - 1.0;
     1.0 + u * u * ((OVERSHOOT + 1.0) * u + OVERSHOOT)
 }
@@ -241,9 +275,9 @@ pub struct View<'a> {
 /// one is trimmed. Below this the cabinet stops shrinking and lets the terminal cut it off,
 /// since a column three characters wide answers no question.
 const MIN_CELL: usize = 10;
-/// Widest a reel gets. Past a full model id and its suffix the column is only stretching,
-/// and three columns that wide already fill a very large terminal.
-const MAX_CELL: usize = 60;
+/// Widest a reel gets. Long model ids fit well before this; past it the column is only
+/// stretching, and a cabinet wider than the eye can cross reads as a wall, not a machine.
+const MAX_CELL: usize = 30;
 /// The right-hand margin the handle lives in, and the click target the picker reads back.
 const MARGIN: usize = 9;
 /// Columns the cabinet spends on something other than the reels: two walls, and the four
@@ -252,8 +286,9 @@ const GUTTERS: usize = 6;
 /// Rows the cabinet spends on something other than the drum: sign, banner, titles, edges,
 /// status, marquees, borders, plus the payline itself.
 const CHROME: usize = 13;
-/// Deepest drum. Past this the payline is so far from the edges that the eye loses it.
-const MAX_REACH: isize = 16;
+/// Deepest drum. Three rows either side of the payline is enough to read as a wheel; past
+/// that the machine grows tall without showing more, and the payline drifts off centre.
+const MAX_REACH: isize = 3;
 
 /// Row the handle starts on. Level with the reel titles, so it stands beside the drum.
 const LEVER_TOP: usize = 5;
@@ -588,16 +623,18 @@ fn band(v: &View, offset: isize, g: &Geo) -> Vec<Span<'static>> {
             (true, true, false) => Style::new()
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
+            // Running, and still to be read: bright enough that a name crossing the payline
+            // registers, dimmer than a landed one so a stop is unmistakable.
             (true, false, _) => match moving {
-                true => Style::new().fg(Color::LightRed),
+                true => Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
                 false => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
             },
-            // Off the payline, and the further off the fainter: the drum falls away. A
-            // moving drum fades harder, which is the smear the terminal cannot draw.
-            _ => match (offset.abs(), moving) {
-                (1, false) => Style::new().fg(Color::Gray),
-                (1, true) => Style::new().fg(Color::DarkGray),
-                _ => Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            // Off the payline, and the further off the fainter: the drum falls away.
+            _ => match offset.abs() {
+                1 => Style::new().fg(Color::Gray),
+                _ => Style::new().fg(Color::DarkGray),
             },
         };
         spans.push(Span::styled(text, style));
@@ -760,26 +797,34 @@ mod tests {
     #[test]
     fn a_wider_terminal_buys_wider_reels() {
         assert!(geo(200, 40).cell > geo(80, 24).cell);
-        assert!(geo(200, 60).reach > geo(80, 24).reach);
+        // Height is the exception: the drum stops deepening once it reads as a wheel, so a
+        // tall terminal keeps its room instead of the machine taking all of it.
+        assert_eq!(geo(200, 60).reach, geo(80, 24).reach);
+        assert!(geo(80, 16).reach < geo(80, 24).reach);
         // Too narrow for the handle: the reels keep the room and the space bar takes over.
         assert_eq!(geo(34, 20).margin, 0);
         assert!(geo(100, 24).margin > 0);
     }
 
-    /// A wide terminal has to be filled, not decorated with a small machine in the middle.
+    /// A cabinet that grows without bound stops being a machine: it has to stay a thing
+    /// sitting in the terminal, wide enough for the longest id and no taller than a glance.
     #[test]
-    fn a_big_terminal_is_mostly_cabinet() {
+    fn a_big_terminal_does_not_get_swallowed() {
         for (w, h) in [(120u16, 30u16), (160, 45), (200, 50)] {
             let g = geo(w, h);
             let used = g.inner + 2 + g.margin;
             assert!(
-                used + 6 >= w as usize,
-                "at {w}x{h} the cabinet is {used} wide and leaves {} columns empty",
-                w as usize - used
+                used <= w as usize,
+                "at {w}x{h} the cabinet is {used} wide and does not fit"
             );
             assert!(
-                g.height() * 4 >= h as usize * 3,
-                "at {w}x{h} the cabinet is only {} rows tall",
+                g.cell >= 30,
+                "at {w}x{h} a reel is only {} wide, too narrow for a model id",
+                g.cell
+            );
+            assert!(
+                g.height() * 2 <= h as usize + 8,
+                "at {w}x{h} the cabinet is {} rows tall, which is most of the screen",
                 g.height()
             );
         }
@@ -832,7 +877,7 @@ mod tests {
                 r.tick(1.0 / 30.0);
             }
             assert!(r.speed > BLUR_SPEED, "the drum never reached full speed");
-            r.brake_to(row, 2.0);
+            r.brake_to(row);
             let mut frames = 0;
             while !r.tick(1.0 / 30.0) {
                 frames += 1;

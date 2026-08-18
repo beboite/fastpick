@@ -580,9 +580,6 @@ fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
     /// drum stopping and the next being told to.
     const FIRST_RUN: f64 = 1.1;
     const GAP: f64 = 0.45;
-    /// Turns a drum still has to make once it knows where it is going, so the stop is
-    /// watched rather than noticed.
-    const LAPS: f64 = 2.0;
 
     if app.harness_rows.is_empty() {
         app.notice = Some("nothing installed to gamble on".into());
@@ -783,7 +780,7 @@ fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
             if ready {
                 let n = reels[stopping].items.len();
                 let row = rng.below(n);
-                reels[stopping].brake_to(row, LAPS);
+                reels[stopping].brake_to(row);
             }
         }
 
