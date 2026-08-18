@@ -13,6 +13,7 @@ mod launch;
 mod paths;
 mod prompts;
 mod secrets;
+mod slots;
 mod state;
 mod tui;
 mod update;
