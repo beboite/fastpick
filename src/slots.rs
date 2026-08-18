@@ -6,6 +6,9 @@
 //! reel has landed, and the model reel spins on whatever the catalogue lookup is still
 //! fetching behind it.
 //!
+//! Nothing turns on its own. The cabinet comes up idle and waits for the handle to be
+//! pulled, because a machine that starts spinning by itself is a loading screen.
+//!
 //! This module owns the pixels and the dice. The state machine that turns a landing into a
 //! selection lives with the picker, which is the only thing allowed to touch its rows.
 
@@ -57,7 +60,7 @@ impl Reel {
     pub fn teaser(title: &'static str) -> Reel {
         Reel {
             title,
-            items: ["? ? ?", "$ $ $", "7 7 7", "* * *"]
+            items: ["? ? ?", "$ $ $", "7 7 7", "* * *", "B A R", "- - -"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -90,15 +93,29 @@ pub struct View<'a> {
     /// Frame counter. Drives the marquee, the blinking and the jackpot colours, so the
     /// animation needs no clock of its own.
     pub tick: usize,
-    /// 0 up, 1 halfway, 2 pulled.
+    /// 0 up, `LEVER_THROW` fully pulled.
     pub lever: u8,
+    /// Waiting for a pull. The handle pulses and the banner says how to reach it.
+    pub idle: bool,
     pub jackpot: bool,
     pub status: String,
 }
 
 /// Wide enough for a model id carrying a suffix, which is what the third reel lands on.
-const CELL: usize = 18;
+const CELL: usize = 22;
 const INNER: usize = CELL * 3 + 4;
+/// The right-hand margin the handle lives in, and the click target the picker reads back.
+const MARGIN: usize = 7;
+/// Rows of drum above and below the payline. Five symbols per column read as something
+/// turning; three read as a label being replaced.
+const REACH: isize = 2;
+
+/// Rows the handle occupies, counted from the top of the cabinet. The base takes the last
+/// two, so the ball rides the rod above it.
+const LEVER_TOP: usize = 5;
+const LEVER_BASE: usize = 13;
+/// How far down the ball travels on a pull.
+pub const LEVER_THROW: u8 = 3;
 
 /// The casino palette, cycled by the tick so the frame never sits still.
 const LIGHTS: [Color; 4] = [
@@ -108,9 +125,11 @@ const LIGHTS: [Color; 4] = [
     Color::LightCyan,
 ];
 
-pub fn draw(f: &mut Frame, area: Rect, v: &View) {
+/// Draws the cabinet centred in `area` and answers with the handle's rectangle on screen,
+/// which is the only part of it a click means anything on.
+pub fn draw(f: &mut Frame, area: Rect, v: &View) -> Rect {
     let lines = lines(v);
-    let width = (INNER as u16 + 2 + 6).min(area.width);
+    let width = (INNER as u16 + 2 + MARGIN as u16).min(area.width);
     let height = (lines.len() as u16).min(area.height);
     // Centred, and clamped rather than skipped on a small terminal: a machine with its top
     // row cut off is still playable, a machine that refuses to draw is a broken easter egg.
@@ -121,18 +140,30 @@ pub fn draw(f: &mut Frame, area: Rect, v: &View) {
         height,
     };
     f.render_widget(Paragraph::new(lines), box_area);
+
+    // The whole margin, not the three cells the ball sits on: a handle you have to hit
+    // exactly is a handle nobody pulls twice.
+    let handle = Rect {
+        x: box_area.x + INNER as u16 + 2,
+        y: box_area.y + LEVER_TOP as u16,
+        width: MARGIN as u16,
+        height: (LEVER_BASE - LEVER_TOP + 1) as u16,
+    };
+    // On a terminal too narrow for the margin the handle is simply not on screen, and an
+    // empty rectangle is what says so: `intersection` keeps the off-screen corner when it
+    // has nothing to keep, which would leave a click target hanging past the last column.
+    match handle.intersection(box_area) {
+        r if r.width == 0 || r.height == 0 => Rect::default(),
+        r => r,
+    }
 }
 
 fn lines(v: &View) -> Vec<Line<'static>> {
-    let frame = match v.jackpot {
-        // The whole cabinet joins in once it has paid out.
-        true => LIGHTS[(v.tick / 2) % LIGHTS.len()],
-        false => Color::LightMagenta,
-    };
-    let mut out = Vec::with_capacity(16);
+    let frame = frame_colour(v);
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(20);
 
     out.push(row(
-        0,
+        out.len(),
         vec![Span::styled(
             format!("╔{}╗", "═".repeat(INNER)),
             Style::new().fg(frame),
@@ -140,12 +171,12 @@ fn lines(v: &View) -> Vec<Line<'static>> {
         v,
     ));
     out.push(row(
-        1,
+        out.len(),
         vec![wall(frame), marquee(v.tick, frame), wall(frame)],
         v,
     ));
     out.push(row(
-        2,
+        out.len(),
         vec![
             wall(frame),
             Span::styled(
@@ -158,8 +189,9 @@ fn lines(v: &View) -> Vec<Line<'static>> {
         ],
         v,
     ));
+    out.push(row(out.len(), vec![wall(frame), banner(v), wall(frame)], v));
     out.push(row(
-        3,
+        out.len(),
         vec![Span::styled(
             format!("╠{}╣", "═".repeat(INNER)),
             Style::new().fg(frame),
@@ -174,7 +206,7 @@ fn lines(v: &View) -> Vec<Line<'static>> {
         titles.push(' ');
     }
     out.push(row(
-        4,
+        out.len(),
         vec![
             wall(frame),
             Span::styled(pad(&titles, INNER), Style::new().fg(Color::DarkGray)),
@@ -183,15 +215,15 @@ fn lines(v: &View) -> Vec<Line<'static>> {
         v,
     ));
 
-    out.push(row(5, edge('┌', '┐', frame), v));
-    out.push(row(6, band(v, -1), v));
-    out.push(row(7, band(v, 0), v));
-    out.push(row(8, band(v, 1), v));
-    out.push(row(9, edge('└', '┘', frame), v));
+    out.push(row(out.len(), edge('┌', '┐', frame), v));
+    for offset in -REACH..=REACH {
+        out.push(row(out.len(), band(v, offset), v));
+    }
+    out.push(row(out.len(), edge('└', '┘', frame), v));
 
-    out.push(row(10, vec![wall(frame), blank(), wall(frame)], v));
+    out.push(row(out.len(), vec![wall(frame), blank(), wall(frame)], v));
     out.push(row(
-        11,
+        out.len(),
         vec![
             wall(frame),
             Span::styled(
@@ -208,12 +240,12 @@ fn lines(v: &View) -> Vec<Line<'static>> {
         v,
     ));
     out.push(row(
-        12,
-        vec![wall(frame), marquee(v.tick + 2, frame), wall(frame)],
+        out.len(),
+        vec![wall(frame), marquee(v.tick + 3, frame), wall(frame)],
         v,
     ));
     out.push(row(
-        13,
+        out.len(),
         vec![Span::styled(
             format!("╚{}╝", "═".repeat(INNER)),
             Style::new().fg(frame),
@@ -221,6 +253,41 @@ fn lines(v: &View) -> Vec<Line<'static>> {
         v,
     ));
     out
+}
+
+fn frame_colour(v: &View) -> Color {
+    match v.jackpot {
+        // The whole cabinet joins in once it has paid out.
+        true => LIGHTS[(v.tick / 2) % LIGHTS.len()],
+        false => Color::LightMagenta,
+    }
+}
+
+/// The line under the sign: what the machine wants from you, or what it has just done.
+fn banner(v: &View) -> Span<'static> {
+    let (text, style) = match (v.jackpot, v.idle) {
+        (true, _) => (
+            "*  J A C K P O T  *",
+            Style::new()
+                .fg(LIGHTS[(v.tick / 2) % LIGHTS.len()])
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ),
+        (false, true) => (
+            "insert coin  >>  pull the handle",
+            // Blinks slower than the marquee, which is what makes the eye go to it.
+            match (v.tick / 6) % 2 {
+                0 => Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+                _ => Style::new().fg(Color::DarkGray),
+            },
+        ),
+        (false, false) => (
+            "no refunds  --  the house picks",
+            Style::new().fg(Color::DarkGray),
+        ),
+    };
+    Span::styled(centred(text, INNER), style)
 }
 
 /// One line of the cabinet, with the lever drawn in the margin beside it.
@@ -252,17 +319,13 @@ fn edge(left: char, right: char, c: Color) -> Vec<Span<'static>> {
     ]
 }
 
-/// A horizontal slice through all three reels: the row above the window, the lit one, the
-/// row below. Three visible symbols per reel is what makes a spinning column read as a
-/// spinning column and not as a label changing at random.
+/// A horizontal slice through all three reels: the payline in the middle, two rows of drum
+/// above and below it, fading with distance so the column reads as curved.
 fn band(v: &View, offset: isize) -> Vec<Span<'static>> {
     let lit = offset == 0;
-    let frame = match v.jackpot {
-        true => LIGHTS[(v.tick / 2) % LIGHTS.len()],
-        false => Color::LightMagenta,
-    };
-    // The payline, marked in the margin the other two bands leave blank rather than in a
-    // column of its own: the result of a pull is the middle row and nothing else.
+    let frame = frame_colour(v);
+    // The payline, marked in the margin the other bands leave blank rather than in a column
+    // of its own: the result of a pull is the middle row and nothing else.
     let arrow = |c: &'static str| match lit {
         true => Span::styled(
             c,
@@ -284,8 +347,12 @@ fn band(v: &View, offset: isize) -> Vec<Span<'static>> {
             (true, true, false) => Style::new()
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
-            (true, false, _) => Style::new().fg(Color::White),
-            _ => Style::new().fg(Color::DarkGray),
+            (true, false, _) => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            // Off the payline, and the further off the fainter: the drum falls away.
+            _ => match offset.abs() {
+                1 => Style::new().fg(Color::Gray),
+                _ => Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            },
         };
         spans.push(Span::styled(text, style));
         spans.push(Span::styled("│", Style::new().fg(Color::DarkGray)));
@@ -301,35 +368,44 @@ fn band(v: &View, offset: isize) -> Vec<Span<'static>> {
 fn marquee(tick: usize, frame: Color) -> Span<'static> {
     let mut s = String::with_capacity(INNER);
     for i in 0..INNER {
-        s.push(match (i + tick) % 4 {
+        s.push(match (i + tick) % 6 {
             0 => '*',
-            2 => '.',
+            3 => '.',
             _ => ' ',
         });
     }
     Span::styled(s, Style::new().fg(frame))
 }
 
-/// The handle, six rows tall in the right margin, the ball riding down as it is pulled.
+/// The handle, in the right margin, the ball riding down the rod as it is pulled. Every row
+/// of the margin is drawn, blank ones included, so the click target is a solid block.
 fn lever(index: usize, v: &View) -> Span<'static> {
-    let top = 5usize;
-    let ball = top + v.lever as usize;
-    if index < top || index > top + 4 {
+    if !(LEVER_TOP..=LEVER_BASE).contains(&index) {
         return Span::raw("");
     }
-    let (art, colour) = match index {
-        i if i == ball => ("  (O) ", Color::LightRed),
-        i if i > top + 3 => ("  [=] ", Color::DarkGray),
-        i if i > ball => ("   |  ", Color::Gray),
-        _ => ("      ", Color::Reset),
+    let ball = LEVER_TOP + v.lever as usize;
+    let (art, style) = match index {
+        i if i == LEVER_BASE => (
+            " ▐███▌ ",
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        i if i == LEVER_BASE - 1 => ("  ▄▄▄  ", Style::new().fg(Color::DarkGray)),
+        i if i == ball => (
+            "  (O)  ",
+            Style::new()
+                .fg(match v.idle && (v.tick / 5) % 2 == 1 {
+                    // Idle, so it pulses: the one thing on screen asking to be touched.
+                    true => Color::LightYellow,
+                    false => Color::LightRed,
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        i if i > ball => ("   ║   ", Style::new().fg(Color::Gray)),
+        _ => ("       ", Style::new()),
     };
-    Span::styled(
-        art.to_string(),
-        Style::new().fg(colour).add_modifier(match index == ball {
-            true => Modifier::BOLD,
-            false => Modifier::empty(),
-        }),
-    )
+    Span::styled(art.to_string(), style)
 }
 
 /// Trimmed to the cell, ellipsis included, so a long model id cannot push the cabinet open.
@@ -375,6 +451,17 @@ mod tests {
         }
     }
 
+    fn view(reels: &[Reel; 3], idle: bool, jackpot: bool) -> View<'_> {
+        View {
+            reels,
+            tick: 3,
+            lever: 2,
+            idle,
+            jackpot,
+            status: "JACKPOT".into(),
+        }
+    }
+
     #[test]
     fn every_line_is_the_same_width() {
         let reels = [
@@ -382,22 +469,35 @@ mod tests {
             reel(&["a provider with a very long name"]),
             reel(&["gpt-5"]),
         ];
-        let v = View {
-            reels: &reels,
-            tick: 3,
-            lever: 2,
-            jackpot: true,
-            status: "JACKPOT".into(),
-        };
-        let widths: Vec<usize> = lines(&v).iter().map(|l| l.width()).collect();
+        let widths: Vec<usize> = lines(&view(&reels, false, true))
+            .iter()
+            .map(|l| l.width())
+            .collect();
         // The lever margin is empty on the rows it does not reach, so the cabinet itself is
         // what has to line up: every row is the frame plus, at most, the handle.
         for w in &widths {
             assert!(
-                *w == INNER + 2 || *w == INNER + 8,
+                *w == INNER + 2 || *w == INNER + 2 + MARGIN,
                 "a row came out {w} wide, cabinet is {}",
                 INNER + 2
             );
+        }
+    }
+
+    /// The handle has to fill the rectangle the click handler is handed, at every throw.
+    #[test]
+    fn the_handle_covers_its_whole_click_target() {
+        let reels = [reel(&["x"]), reel(&["y"]), reel(&["z"])];
+        for throw in 0..=LEVER_THROW {
+            let mut v = view(&reels, true, false);
+            v.lever = throw;
+            for index in LEVER_TOP..=LEVER_BASE {
+                assert_eq!(
+                    lever(index, &v).content.chars().count(),
+                    MARGIN,
+                    "row {index} of the handle is not the width of the target"
+                );
+            }
         }
     }
 
@@ -405,16 +505,16 @@ mod tests {
     #[test]
     fn draws_into_a_short_terminal() {
         let reels = [reel(&["x"]), reel(&["y"]), reel(&["z"])];
-        let v = View {
-            reels: &reels,
-            tick: 0,
-            lever: 0,
-            jackpot: false,
-            status: String::new(),
-        };
+        let v = view(&reels, true, false);
         let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
         terminal
-            .draw(|f| draw(f, f.area(), &v))
+            .draw(|f| {
+                let handle = draw(f, f.area(), &v);
+                // Clamped into the frame, so a click is never tested against a rectangle
+                // hanging off the screen.
+                assert!(handle.right() <= f.area().right());
+                assert!(handle.bottom() <= f.area().bottom());
+            })
             .expect("a small terminal must not stop the machine");
     }
 

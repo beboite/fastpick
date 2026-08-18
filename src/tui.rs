@@ -550,12 +550,15 @@ enum Roll {
     Quit,
 }
 
-/// One pull of the lever.
+/// One visit to the machine.
 ///
-/// The reels stop left to right because each answer narrows the next: the provider reel is
-/// filled from the harness that just landed, and the model reel turns on nothing until the
-/// catalogue lookup for that provider comes back. So the wait for the network is the
-/// animation rather than a spinner in front of it.
+/// Nothing turns until the handle is pulled, with space or a click on it: the picker is
+/// about to answer three questions for the user, so it waits to be told to.
+///
+/// The reels then stop left to right because each answer narrows the next: the provider
+/// reel is filled from the harness that just landed, and the model reel turns on nothing
+/// until the catalogue lookup for that provider comes back. So the wait for the network is
+/// the animation rather than a spinner in front of it.
 fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
     const FRAME: Duration = Duration::from_millis(45);
     /// Long enough that a reel reads as spinning rather than as a value being replaced.
@@ -563,6 +566,13 @@ fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
     /// The same ceiling the command-line path puts on a catalogue lookup. A reel that turns
     /// for ever is a menu with no way out.
     const PATIENCE: Duration = Duration::from_secs(20);
+    /// Milliseconds the ball spends on each row of its throw.
+    const THROW_STEP: u128 = 90;
+    /// Waiting to be played, the handle coming down, one stage per reel, then the payout.
+    const IDLE: usize = 0;
+    const PULL: usize = 1;
+    const FIRST_REEL: usize = 2;
+    const PAID: usize = 5;
 
     if app.harness_rows.is_empty() {
         app.notice = Some("nothing installed to gamble on".into());
@@ -570,36 +580,40 @@ fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
     }
 
     let mut rng = Rng::new();
+    // Kept, because a second pull rebuilds the reels from scratch and the harness list is
+    // the one thing no landing can change.
+    let harnesses: Vec<String> = app
+        .harness_rows
+        .iter()
+        .filter_map(|&i| app.cfg.harnesses.get(i))
+        .map(|h| h.name.clone())
+        .collect();
     let mut reels = [
         Reel::teaser("harness"),
         Reel::teaser("provider"),
         Reel::teaser("model"),
     ];
-    reels[0].load(
-        app.harness_rows
-            .iter()
-            .filter_map(|&i| app.cfg.harnesses.get(i))
-            .map(|h| h.name.clone())
-            .collect(),
-    );
+    reels[0].load(harnesses.clone());
 
-    // 0 to 2 while the handle comes down, then one stage per reel, then the payout.
-    let mut stage: usize = 0;
+    let mut stage: usize = IDLE;
     let mut tick: usize = 0;
     let mut lever: u8 = 0;
     let mut began = Instant::now();
     let mut target: Option<usize> = None;
-    let mut status = String::from("pull!");
+    let mut status = String::from("pull the handle   space, or click it");
     // The model reel is filled once, mid-spin, when the catalogue lands. A count would not
     // do: a provider serving three models is indistinguishable from the placeholders.
     let mut model_reel_filled = false;
+    // Where the last frame put the handle. Only the draw knows, since the cabinet is
+    // centred in whatever the terminal happens to be.
+    let mut handle = Rect::default();
 
     loop {
         app.poll_models();
 
         // The model reel has nothing to turn on until the provider has answered, so it
         // keeps its placeholders and the lookup fills it in mid-spin.
-        if stage == 3 && !model_reel_filled && !app.loading() {
+        if stage == FIRST_REEL + 2 && !model_reel_filled && !app.loading() {
             if app.visible_models.is_empty() {
                 app.notice = Some("the machine came up empty, that provider listed nothing".into());
                 return Ok(Roll::Back);
@@ -617,21 +631,24 @@ fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
             status = "model...".into();
         }
 
-        let jackpot = stage == 4;
+        let jackpot = stage == PAID;
+        let idle = stage == IDLE;
         terminal.draw(|f| {
-            slots::draw(
+            handle = slots::draw(
                 f,
                 f.area(),
                 &View {
                     reels: &reels,
                     tick,
                     lever,
+                    idle,
                     jackpot,
                     status: status.clone(),
                 },
             )
         })?;
 
+        let mut pulled = false;
         if event::poll(FRAME)? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
@@ -644,6 +661,7 @@ fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
                             app.notice = Some("no bet taken".into());
                             return Ok(Roll::Back);
                         }
+                        KeyCode::Char(' ') => pulled = true,
                         // Only pays once every reel has landed, so an early Enter is the
                         // impatience it looks like and not a launch of half a choice.
                         KeyCode::Enter if jackpot => {
@@ -655,24 +673,60 @@ fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
                         _ => {}
                     }
                 }
+                Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    pulled = handle.width > 0
+                        && m.column >= handle.x
+                        && m.column < handle.x + handle.width
+                        && m.row >= handle.y
+                        && m.row < handle.y + handle.height;
+                }
                 _ => {}
             }
         }
+
+        // A pull on a machine that has already paid is a re-roll: the reels go back to
+        // their placeholders and everything it decided is up for grabs again.
+        if pulled && (stage == IDLE || stage == PAID) {
+            reels = [
+                Reel::teaser("harness"),
+                Reel::teaser("provider"),
+                Reel::teaser("model"),
+            ];
+            reels[0].load(harnesses.clone());
+            model_reel_filled = false;
+            target = None;
+            lever = 0;
+            stage = PULL;
+            began = Instant::now();
+            status = String::new();
+        }
+
         tick = tick.wrapping_add(1);
 
         match stage {
-            // The handle coming down. Three positions, then the first reel goes.
-            0 => {
-                lever = (began.elapsed().as_millis() / 110).min(2) as u8;
-                if began.elapsed() > Duration::from_millis(360) {
-                    stage = 1;
+            // Loose drums, drifting. Enough movement to say the thing is switched on, slow
+            // enough that nobody mistakes it for a roll already under way.
+            IDLE => {
+                if tick.is_multiple_of(6) {
+                    for r in reels.iter_mut() {
+                        let len = r.items.len().max(1);
+                        r.pos = (r.pos + 1) % len;
+                    }
+                }
+            }
+            // The handle coming down, then the first reel goes.
+            PULL => {
+                lever = (began.elapsed().as_millis() / THROW_STEP).min(slots::LEVER_THROW as u128)
+                    as u8;
+                if began.elapsed().as_millis() > THROW_STEP * (slots::LEVER_THROW as u128 + 1) {
+                    stage = FIRST_REEL;
                     began = Instant::now();
                     status = "harness...".into();
                 }
             }
-            1..=3 => {
-                let i = stage - 1;
-                let waiting = stage == 3 && app.loading();
+            s if (FIRST_REEL..PAID).contains(&s) => {
+                let i = stage - FIRST_REEL;
+                let waiting = i == 2 && app.loading();
                 if waiting {
                     status = format!(
                         "asking {} what it serves...",
@@ -728,7 +782,7 @@ fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
                         _ => {
                             app.model_idx = row;
                             app.ensure_options();
-                            status = "JACKPOT   enter launch   esc back".into();
+                            status = "JACKPOT   enter launch   space reroll   esc back".into();
                         }
                     }
                     stage += 1;
