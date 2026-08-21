@@ -4,7 +4,9 @@
 //! menu stays usable while the network is slow or dead. No screen blocks on a socket.
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::prelude::*;
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::DefaultTerminal;
@@ -16,6 +18,7 @@ use std::time::{Duration, Instant};
 use crate::catalog::{self, Listed, Source};
 use crate::config::{Config, Model};
 use crate::prompts::{self, PromptFile};
+use crate::slots::{self, Reel, Rng, View};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Screen {
@@ -120,6 +123,11 @@ pub struct App<'a> {
     /// `ratatui::init()` is wiped by the switch to the alternate screen a moment later.
     notice: Option<String>,
 
+    /// Where the lucky line ended up last frame: row, first column, last column. Written
+    /// by the draw and read by a click, because the footer sits under a body whose height
+    /// is only known once the screen has been laid out.
+    lucky_zone: std::cell::Cell<(u16, u16, u16)>,
+
     /// A newer release, if the last check found one. Read once here rather than per frame,
     /// which also means a check that lands during this run shows up on the next one. That
     /// is the right side to err on for a line nobody asked for.
@@ -170,6 +178,7 @@ impl<'a> App<'a> {
             opt_row: 0,
             unsupported: Vec::new(),
             notice: None,
+            lucky_zone: std::cell::Cell::new((0, 0, 0)),
             update_available: crate::update::pending(),
         };
         app.rebuild_providers();
@@ -523,6 +532,302 @@ impl<'a> App<'a> {
     pub fn set_screen(&mut self, s: Screen) {
         self.screen = s;
     }
+
+    /// Whether a click landed on the lucky line, using where the last frame put it.
+    fn on_lucky(&self, column: u16, row: u16) -> bool {
+        let (y, x0, x1) = self.lucky_zone.get();
+        row == y && column >= x0 && column < x1
+    }
+}
+
+/// What a pull of the lever ended in.
+enum Roll {
+    /// The machine paid and the user took it. Boxed because this arm is a whole selection
+    /// and the other two are nothing, so the enum would be that size everywhere.
+    Launch(Box<Picked>),
+    /// Back to the menu, with whatever the reels landed on already selected.
+    Back,
+    Quit,
+}
+
+/// One visit to the machine.
+///
+/// Nothing turns until the handle is pulled, with space or a click on it: the picker is
+/// about to answer three questions for the user, so it waits to be told to.
+///
+/// All three drums then go at once and stop left to right, because each answer narrows the
+/// next: the provider reel is refilled while it is still turning, from the harness that has
+/// just landed, and the model reel runs on casino symbols until the catalogue lookup for
+/// that provider comes back. So the wait for the network is the animation rather than a
+/// spinner in front of it.
+///
+/// The loop keeps no reel state of its own beyond which drum is due to stop next: the
+/// physics lives in `slots`, and what a landing means lives in `App`.
+fn play_slots(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Roll> {
+    /// 30 frames a second. The drums cross two dozen rows a second at full tilt, which needs
+    /// the frames to keep the motion continuous rather than steppy.
+    const FRAME: Duration = Duration::from_millis(33);
+    /// The same ceiling the command-line path puts on a catalogue lookup. A reel that turns
+    /// for ever is a menu with no way out.
+    const PATIENCE: Duration = Duration::from_secs(20);
+    /// Seconds the cabinet takes to light up when the machine is opened.
+    const BOOT: f64 = 0.7;
+    /// The pull: slammed down, held, then let back up at its own pace.
+    const DOWN: f64 = 0.16;
+    const HOLD: f64 = 0.10;
+    const UP: f64 = 0.55;
+    /// How long the first drum runs before it is allowed to brake, and the gap between one
+    /// drum stopping and the next being told to.
+    const FIRST_RUN: f64 = 1.1;
+    const GAP: f64 = 0.45;
+
+    if app.harness_rows.is_empty() {
+        app.notice = Some("nothing installed to gamble on".into());
+        return Ok(Roll::Back);
+    }
+
+    /// Where the handle is, from how long ago it was pulled: down fast under the hand, then
+    /// eased back up on its spring.
+    fn lever_at(t: f64) -> f64 {
+        const DOWN: f64 = 0.16;
+        const HOLD: f64 = 0.10;
+        const UP: f64 = 0.55;
+        match t {
+            t if t < DOWN => (t / DOWN).powi(2),
+            t if t < DOWN + HOLD => 1.0,
+            t if t < DOWN + HOLD + UP => (1.0 - (t - DOWN - HOLD) / UP).powi(3),
+            _ => 0.0,
+        }
+    }
+
+    let mut rng = Rng::new();
+    // Kept, because a second pull rebuilds the reels from scratch and the harness list is
+    // the one thing no landing can change.
+    let harnesses: Vec<String> = app
+        .harness_rows
+        .iter()
+        .filter_map(|&i| app.cfg.harnesses.get(i))
+        .map(|h| h.name.clone())
+        .collect();
+    let mut reels = [
+        Reel::teaser("harness"),
+        Reel::teaser("provider"),
+        Reel::teaser("model"),
+    ];
+    reels[0].load(harnesses.clone());
+
+    let mut tick: usize = 0;
+    let opened = Instant::now();
+    let mut last = Instant::now();
+    // None until the handle is touched, then seconds since, which drives both the handle and
+    // the moment the drums are let go.
+    let mut pulled_at: Option<f64> = None;
+    // The drum due to stop next, and 3 once the machine has paid.
+    let mut stopping: usize = 0;
+    let mut spinning = false;
+    let mut since_stop = 0.0f64;
+    let mut run = 0.0f64;
+    let mut waited = Instant::now();
+    let mut status = String::from("pull the handle   space, or click it");
+    // The model reel is filled once, mid-spin, when the catalogue lands. A count would not
+    // do: a provider serving three models is indistinguishable from the symbols.
+    let mut model_reel_filled = false;
+    // Where the last frame put the handle. Only the draw knows, since the cabinet is
+    // centred in whatever the terminal happens to be.
+    let mut handle = Rect::default();
+
+    loop {
+        app.poll_models();
+        let dt = last.elapsed().as_secs_f64().min(0.1);
+        last = Instant::now();
+
+        let jackpot = stopping == 3;
+        let idle = pulled_at.is_none();
+        let lever = pulled_at.map(lever_at).unwrap_or(0.0);
+        let boot = (opened.elapsed().as_secs_f64() / BOOT).min(1.0);
+        terminal.draw(|f| {
+            handle = slots::draw(
+                f,
+                f.area(),
+                &View {
+                    reels: &reels,
+                    tick,
+                    lever,
+                    boot,
+                    idle,
+                    jackpot,
+                    status: status.clone(),
+                },
+            )
+        })?;
+
+        let mut pull = false;
+        if event::poll(FRAME)? {
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+                        return Ok(Roll::Quit);
+                    }
+                    match k.code {
+                        KeyCode::Char('q') => return Ok(Roll::Quit),
+                        KeyCode::Esc => {
+                            app.notice = Some("no bet taken".into());
+                            return Ok(Roll::Back);
+                        }
+                        KeyCode::Char(' ') => pull = true,
+                        // Only pays once every reel has landed, so an early Enter is the
+                        // impatience it looks like and not a launch of half a choice.
+                        KeyCode::Enter if jackpot => {
+                            return Ok(match app.picked() {
+                                Some(p) => Roll::Launch(Box::new(p)),
+                                None => Roll::Back,
+                            })
+                        }
+                        _ => {}
+                    }
+                }
+                Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    pull = handle.width > 0
+                        && m.column >= handle.x
+                        && m.column < handle.x + handle.width
+                        && m.row >= handle.y
+                        && m.row < handle.y + handle.height;
+                }
+                _ => {}
+            }
+        }
+
+        // A pull on a machine that has already paid is a re-roll: the drums go back to their
+        // symbols and everything it decided is up for grabs again.
+        if pull && (idle || jackpot) {
+            reels = [
+                Reel::teaser("harness"),
+                Reel::teaser("provider"),
+                Reel::teaser("model"),
+            ];
+            reels[0].load(harnesses.clone());
+            model_reel_filled = false;
+            stopping = 0;
+            spinning = false;
+            run = 0.0;
+            pulled_at = Some(0.0);
+            status = String::new();
+        }
+
+        tick = tick.wrapping_add(1);
+        if let Some(t) = pulled_at.as_mut() {
+            *t += dt;
+            // The drums are let go at the bottom of the throw, not when the handle is
+            // touched: the machine answers the pull, it does not anticipate it.
+            if !spinning && *t >= DOWN && stopping < 3 {
+                for r in reels.iter_mut() {
+                    r.kick();
+                }
+                spinning = true;
+                run = 0.0;
+                waited = Instant::now();
+                status = "no going back".into();
+            }
+            if *t > DOWN + HOLD + UP && !spinning {
+                pulled_at = None;
+            }
+        }
+
+        // The model reel has nothing to turn on until the provider has answered, so it keeps
+        // its symbols and the lookup fills it in mid-spin.
+        if stopping == 2 && !model_reel_filled && !app.loading() {
+            if app.visible_models.is_empty() {
+                app.notice = Some("the machine came up empty, that provider listed nothing".into());
+                return Ok(Roll::Back);
+            }
+            reels[2].load(
+                app.visible_models
+                    .iter()
+                    .filter_map(|&i| app.models.get(i))
+                    .map(|l| l.model.display().to_string())
+                    .collect(),
+            );
+            model_reel_filled = true;
+        }
+
+        run += dt;
+        since_stop += dt;
+        let mut landed = None;
+        for (i, r) in reels.iter_mut().enumerate() {
+            if r.tick(dt) {
+                landed = Some(i);
+            }
+        }
+
+        if spinning && stopping < 3 {
+            // The next drum is told where to stop once it has been seen to run, and once
+            // whatever fills it has answered.
+            let ready = match stopping {
+                0 => run >= FIRST_RUN,
+                2 => since_stop >= GAP && model_reel_filled,
+                _ => since_stop >= GAP,
+            };
+            if stopping == 2 && !model_reel_filled {
+                status = format!(
+                    "asking {} what it serves...",
+                    app.provider().map(|p| p.name.as_str()).unwrap_or("")
+                );
+                if waited.elapsed() > PATIENCE {
+                    app.notice = Some("the catalogue never answered, so nothing was rolled".into());
+                    return Ok(Roll::Back);
+                }
+            }
+            if ready {
+                let n = reels[stopping].items.len();
+                let row = rng.below(n);
+                reels[stopping].brake_to(row);
+            }
+        }
+
+        // A drum coming to rest is what advances the machine: the row it stopped on is the
+        // answer, and filling the next reel is the question it asks.
+        if landed == Some(stopping) {
+            let row = reels[stopping].row();
+            since_stop = 0.0;
+            match stopping {
+                0 => {
+                    app.harness_row = row;
+                    app.provider_row = 0;
+                    app.rebuild_providers();
+                    if app.provider_rows.is_empty() {
+                        app.notice = Some("that harness has no provider to gamble on".into());
+                        return Ok(Roll::Back);
+                    }
+                    reels[1].load(
+                        app.provider_rows
+                            .iter()
+                            .filter_map(|&p| app.cfg.providers.get(p))
+                            .map(|p| p.name.clone())
+                            .collect(),
+                    );
+                    status = "provider...".into();
+                }
+                1 => {
+                    app.provider_row = row;
+                    // `--key` narrowed an answer the user gave; the machine is answering for
+                    // them, so every key of the site is in play.
+                    app.only_key = None;
+                    app.set_screen(Screen::Model);
+                    app.load_models(false);
+                    waited = Instant::now();
+                    status = "model...".into();
+                }
+                _ => {
+                    app.model_idx = row;
+                    app.ensure_options();
+                    spinning = false;
+                    pulled_at = None;
+                    status = "JACKPOT   enter launch   space reroll   esc back".into();
+                }
+            }
+            stopping += 1;
+        }
+    }
 }
 
 /// Runs the picker. `Ok(None)` means the user quit without choosing.
@@ -594,7 +899,14 @@ pub fn run(cfg: &Config, start: &Start) -> Result<Option<Picked>> {
     crate::update::check_in_background();
 
     let mut terminal = ratatui::init();
+    // Only for the lucky line, which is a button and so has to be clickable. Failing to
+    // enable it is not a reason to refuse the menu: every key still works, the button just
+    // needs its shortcut.
+    let mouse = crossterm::execute!(std::io::stdout(), event::EnableMouseCapture).is_ok();
     let result = event_loop(&mut terminal, &mut app, pending_model.as_deref());
+    if mouse {
+        let _ = crossterm::execute!(std::io::stdout(), event::DisableMouseCapture);
+    }
     ratatui::restore();
     result
 }
@@ -650,17 +962,35 @@ fn event_loop(
             continue;
         }
 
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            // The lucky line is the only thing on screen a click means anything on.
+            Event::Mouse(m)
+                if m.kind == MouseEventKind::Down(MouseButton::Left)
+                    && app.on_lucky(m.column, m.row) =>
+            {
+                match play_slots(terminal, app)? {
+                    Roll::Launch(p) => return Ok(Some(*p)),
+                    Roll::Quit => return Ok(None),
+                    Roll::Back => continue,
+                }
+            }
+            _ => continue,
         };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
         // Read once, then gone: it explains the screen the user just landed on, and past
         // that it would sit on top of the catalogue line for the rest of the session.
         app.notice = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(None);
+        }
+        // The same lever, for anyone who does not have a mouse in a terminal. Ctrl rather
+        // than a bare letter: the model screen types every plain key into its filter.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+            match play_slots(terminal, app)? {
+                Roll::Launch(p) => return Ok(Some(*p)),
+                Roll::Quit => return Ok(None),
+                Roll::Back => continue,
+            }
         }
 
         match app.screen {
@@ -830,8 +1160,9 @@ fn draw(f: &mut Frame, app: &App) {
         Some(p) => height_of(p, right_width),
         None => 0,
     });
-    // title, blank, body, blank, status, help, and the update line when there is one.
-    let footer_height = if app.update_available.is_some() { 3 } else { 2 };
+    // title, blank, body, blank, status, help, the lucky line, and the update line when
+    // there is one.
+    let footer_height = if app.update_available.is_some() { 4 } else { 3 };
     let room = area.height.saturating_sub(3 + footer_height as u16).max(1);
     let height = wanted.clamp(1, room);
 
@@ -891,6 +1222,14 @@ fn draw(f: &mut Frame, app: &App) {
             )),
             footer_line(app),
         ];
+        lines.push(lucky_line());
+        // The line is a button, so where it landed has to survive the frame: a click knows
+        // a row and a column, and nothing else on screen can tell it what sits there.
+        app.lucky_zone.set((
+            footer.y + lines.len() as u16 - 1,
+            footer.x,
+            footer.x + LUCKY.chars().count() as u16,
+        ));
         if let Some(v) = &app.update_available {
             lines.push(Line::from(Span::styled(
                 format!(
@@ -1099,6 +1438,23 @@ fn footer_line(app: &App) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         dim(format!("   {}", help(app))),
+    ])
+}
+
+/// The clickable part of the lucky line. Its width is the hit box, so the two must stay
+/// the same string.
+const LUCKY: &str = "777  I'm feeling lucky";
+
+fn lucky_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "777",
+            Style::new()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  I'm feeling lucky", Style::new().fg(Color::LightMagenta)),
+        dim("   click it, or ctrl+l".to_string()),
     ])
 }
 
@@ -1560,6 +1916,27 @@ mod tests {
             }
             println!();
         }
+    }
+
+    /// The lever is a button, and a button whose hit box has drifted off the line it draws
+    /// is a button that does nothing on click with nothing on screen to say why.
+    #[test]
+    fn the_lucky_line_is_where_a_click_looks_for_it() {
+        let cfg = cfg();
+        let app = App::new(&cfg, &Start::default());
+        let lines = render_lines(&app);
+        let row = lines
+            .iter()
+            .position(|l| l.contains("I'm feeling lucky"))
+            .expect("the lucky line must be drawn");
+
+        let (y, x0, x1) = app.lucky_zone.get();
+        assert_eq!(y as usize, row);
+        assert!(app.on_lucky(x0, y));
+        assert!(app.on_lucky(x1 - 1, y));
+        // Past the label, and one row off, are both misses.
+        assert!(!app.on_lucky(x1, y));
+        assert!(!app.on_lucky(x0, y + 1));
     }
 
     #[test]
