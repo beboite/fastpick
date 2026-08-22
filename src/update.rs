@@ -153,10 +153,13 @@ pub fn check_in_background() {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(20))
-        .user_agent(&format!("fastpick/{}", current_version()))
-        .build()
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(20)))
+            .http_status_as_error(false)
+            .user_agent(format!("fastpick/{}", current_version()))
+            .build(),
+    )
 }
 
 /// A token for a repository that is not public. Read from the environment rather than
@@ -168,24 +171,28 @@ fn gh_token() -> Option<String> {
         .filter(|t| !t.trim().is_empty())
 }
 
-fn with_auth(req: ureq::Request) -> ureq::Request {
-    let req = req.set("X-GitHub-Api-Version", "2022-11-28");
+fn with_auth(
+    req: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    let req = req.header("X-GitHub-Api-Version", "2022-11-28");
     match gh_token() {
-        Some(t) => req.set("Authorization", &format!("Bearer {t}")),
+        Some(t) => req.header("Authorization", format!("Bearer {t}")),
         None => req,
     }
 }
 
 fn latest_release() -> Result<serde_json::Value> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let resp = with_auth(
+    let mut resp = with_auth(
         agent()
             .get(&url)
-            .set("Accept", "application/vnd.github+json"),
+            .header("Accept", "application/vnd.github+json"),
     )
     .call()
     .map_err(describe)?;
-    resp.into_json()
+    check_status(&mut resp)?;
+    resp.body_mut()
+        .read_json()
         .context("GitHub answered something that is not JSON")
 }
 
@@ -198,34 +205,43 @@ fn latest_version() -> Result<String> {
     Ok(tag.trim_start_matches('v').to_string())
 }
 
-/// A one-line reason, with the private-repo case named rather than left as "HTTP 404".
+/// A one-line reason for a transport-level failure (DNS, TLS, timeout). Status codes
+/// are handled by `check_status`: ureq 3's `Error::StatusCode` is only a number.
 fn describe(e: ureq::Error) -> anyhow::Error {
-    match e {
+    let s = e.to_string();
+    anyhow!("{}", s.lines().next().unwrap_or("transport error"))
+}
+
+fn header_str<'a>(resp: &'a ureq::http::Response<ureq::Body>, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+/// A one-line reason, with the private-repo case named rather than left as "HTTP 404".
+fn check_status(resp: &mut ureq::http::Response<ureq::Body>) -> Result<()> {
+    let code = resp.status().as_u16();
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    Err(match code {
         // The same 404 covers "no published release", "private repository" and "your token
         // cannot see it", and GitHub's own body says none of the three.
-        ureq::Error::Status(404, _) if gh_token().is_none() => anyhow!(
+        404 if gh_token().is_none() => anyhow!(
             "no published release found for {REPO}. If the repository is private, set GH_TOKEN to a token that can read it."
         ),
-        ureq::Error::Status(404, _) => anyhow!(
+        404 => anyhow!(
             "no published release found for {REPO}. A draft release does not count until someone presses publish, and GH_TOKEN has to be able to read the repository."
         ),
-        ureq::Error::Status(403, r) | ureq::Error::Status(429, r)
-            if r.header("x-ratelimit-remaining") == Some("0") =>
-        {
+        403 | 429 if header_str(resp, "x-ratelimit-remaining") == Some("0") => {
             anyhow!("GitHub's rate limit is exhausted for this IP. Set GH_TOKEN to raise it.")
         }
-        ureq::Error::Status(code, r) => match r.into_string() {
+        code => match resp.body_mut().read_to_string() {
             Ok(body) if !body.trim().is_empty() => {
                 let line = body.lines().next().unwrap_or_default();
                 anyhow!("HTTP {code}: {}", &line[..line.len().min(200)])
             }
             _ => anyhow!("HTTP {code}"),
         },
-        ureq::Error::Transport(t) => {
-            let s = t.to_string();
-            anyhow!("{}", s.lines().next().unwrap_or("transport error"))
-        }
-    }
+    })
 }
 
 /// The download url for one asset of a release.
@@ -244,13 +260,18 @@ fn asset_url(release: &serde_json::Value, name: &str) -> Option<String> {
 }
 
 fn download(url: &str, limit: usize) -> Result<Vec<u8>> {
-    let resp = with_auth(agent().get(url).set("Accept", "application/octet-stream"))
-        .call()
-        .map_err(describe)?;
+    let mut resp = with_auth(
+        agent()
+            .get(url)
+            .header("Accept", "application/octet-stream"),
+    )
+    .call()
+    .map_err(describe)?;
+    check_status(&mut resp)?;
     let mut buf = Vec::new();
     // Bounded: `into_reader` has no cap of its own, and a wrong url pointing at something
     // enormous would otherwise be read until the machine runs out of memory.
-    std::io::Read::take(resp.into_reader(), limit as u64 + 1)
+    std::io::Read::take(resp.into_body().into_reader(), limit as u64 + 1)
         .read_to_end(&mut buf)
         .context("reading the download")?;
     if buf.len() > limit {

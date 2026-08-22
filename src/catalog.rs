@@ -220,33 +220,44 @@ fn fetch(r: &Request) -> Result<Vec<Entry>> {
         .as_ref()
         .ok_or_else(|| anyhow!("no catalogue declared"))?;
 
-    // `redirects(0)` is not a preference. ureq strips `authorization` and `cookie` when it
-    // follows a redirect, but not `x-api-key`, so a catalogue host answering 302 would be
-    // handed the raw Anthropic key for whatever location it names.
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(Duration::from_secs(15))
-        .build();
+    // `max_redirects(0)` is not a preference. ureq 2 stripped `authorization` and `cookie`
+    // when it followed a redirect, but not `x-api-key`, so a catalogue host answering 302
+    // would be handed the raw key for whatever location it names. Off, still: the key must
+    // not travel there.
+    //
+    // `http_status_as_error(false)` keeps 3xx/4xx/5xx as a response so the location header
+    // and the body can be read. ureq 3's `Error::StatusCode` is only a number.
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(15)))
+            .build(),
+    );
     let mut req = agent.get(&cat.url);
     match cat.auth {
         CatalogAuth::None => {}
         CatalogAuth::XApiKey => {
             let token = read_token(r.token_file.as_ref())
                 .ok_or_else(|| anyhow!("no key file to authenticate with"))?;
-            req = req.set("x-api-key", &token);
-            req = req.set("anthropic-version", "2023-06-01");
+            req = req.header("x-api-key", &token);
+            req = req.header("anthropic-version", "2023-06-01");
         }
         CatalogAuth::Bearer => {
             let token = read_token(r.token_file.as_ref())
                 .ok_or_else(|| anyhow!("no key file to authenticate with"))?;
-            req = req.set("Authorization", &format!("Bearer {token}"));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
     }
 
-    let body: serde_json::Value = req
-        .call()
-        .map_err(|e| anyhow!(short_http_error(e)))?
-        .into_json()
+    let mut resp = req.call().map_err(|e| anyhow!(short_http_error(e)))?;
+    let code = resp.status().as_u16();
+    if !resp.status().is_success() {
+        return Err(anyhow!(short_http_status(code, &mut resp)));
+    }
+    let body: serde_json::Value = resp
+        .body_mut()
+        .read_json()
         .context("the catalogue answered something that is not JSON")?;
 
     let items = match body.get("data").and_then(|d| d.as_array()) {
@@ -326,30 +337,30 @@ fn first_line(s: &str) -> String {
 
 /// ureq renders a failed call as several lines including the whole body. One line is
 /// enough on a status bar.
-///
+fn short_http_error(e: ureq::Error) -> String {
+    let s = e.to_string();
+    s.lines().next().unwrap_or("transport error").to_string()
+}
+
 /// The body is read rather than dropped: a bare `HTTP 401` reads the same for a wrong key,
 /// an expired key, a wrong url path and a wrong organisation, and that is the failure users
 /// actually hit.
-fn short_http_error(e: ureq::Error) -> String {
-    match e {
-        ureq::Error::Status(code, r) => {
-            // A 3xx only reaches here because redirects are off, and "HTTP 302" would say
-            // nothing about why the key was not sent along.
-            if (300..400).contains(&code) {
-                let to = r.header("location").unwrap_or("elsewhere").to_string();
-                return format!("HTTP {code}: the catalogue redirects to {to}, not followed because the key must not travel there. Point `url` at the final address.");
-            }
-            match r.into_string() {
-                Ok(body) if !body.trim().is_empty() => {
-                    format!("HTTP {code}: {}", first_line(&body))
-                }
-                _ => format!("HTTP {code}"),
-            }
+fn short_http_status(code: u16, resp: &mut ureq::http::Response<ureq::Body>) -> String {
+    // A 3xx only reaches here because redirects are off, and "HTTP 302" would say
+    // nothing about why the key was not sent along.
+    if (300..400).contains(&code) {
+        let to = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("elsewhere");
+        return format!("HTTP {code}: the catalogue redirects to {to}, not followed because the key must not travel there. Point `url` at the final address.");
+    }
+    match resp.body_mut().read_to_string() {
+        Ok(body) if !body.trim().is_empty() => {
+            format!("HTTP {code}: {}", first_line(&body))
         }
-        ureq::Error::Transport(t) => {
-            let s = t.to_string();
-            s.lines().next().unwrap_or("transport error").to_string()
-        }
+        _ => format!("HTTP {code}"),
     }
 }
 
