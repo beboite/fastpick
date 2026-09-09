@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 anyhow = "1"
 crossterm = "0.29"
-dirs = "6"
+dirs = "7"
 # Verifies the signature on a downloaded release before it replaces this binary. Pure
 # Rust, no transitive dependencies, and it only ever verifies: no key material is handled.
 minisign-verify = "0.2"
