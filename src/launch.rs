@@ -1109,14 +1109,24 @@ mod tests {
     fn codex_config_overrides_follow_subcommands() {
         let (_d, cfg) = fixture();
         let m = Model::new("acme-large".into());
-        for tail in [vec!["resume", "thread-id"], vec!["exec", "resume", "thread-id", "hello"]] {
+        for tail in [
+            vec!["resume", "thread-id"],
+            vec!["exec", "resume", "thread-id", "hello"],
+        ] {
             let mut sel = selection(&cfg, "codex", "acme", &m);
             sel.passthrough = tail.iter().map(|s| s.to_string()).collect();
-            sel.passthrough.extend(["-c".into(), "model_reasoning_effort=\"high\"".into()]);
+            sel.passthrough
+                .extend(["-c".into(), "model_reasoning_effort=\"high\"".into()]);
             let args = args_of(&build(&cfg, &sel).unwrap());
             let last = args.iter().position(|s| s == tail.last().unwrap()).unwrap();
-            let provider = args.iter().position(|s| s == "model_provider=\"fastpick\"").unwrap();
-            assert!(provider > last, "provider must reach the subcommand: {args:?}");
+            let provider = args
+                .iter()
+                .position(|s| s == "model_provider=\"fastpick\"")
+                .unwrap();
+            assert!(
+                provider > last,
+                "provider must reach the subcommand: {args:?}"
+            );
             assert_eq!(args.last().unwrap(), "model_reasoning_effort=\"high\"");
         }
     }
