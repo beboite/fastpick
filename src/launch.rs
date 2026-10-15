@@ -365,6 +365,32 @@ pub fn build(cfg: &Config, sel: &Selection) -> Result<Command> {
         cmd.arg(a);
     }
 
+    if sel.harness.kind == HarnessKind::Codex {
+        // Codex subcommands parse their own config overrides. Keep their order,
+        // but place them at the deepest command, before any literal prompt tail.
+        let mut rest = Vec::new();
+        let mut overrides = Vec::new();
+        let mut args = std::mem::take(&mut cmd.args).into_iter().peekable();
+        while let Some(arg) = args.next() {
+            if arg == "--" {
+                rest.append(&mut overrides);
+                rest.push(arg);
+                rest.extend(args);
+                break;
+            }
+            if (arg == "-c" || arg == "--config") && args.peek().is_some() {
+                overrides.push(arg);
+                overrides.push(args.next().unwrap());
+            } else if arg.to_string_lossy().starts_with("--config=") {
+                overrides.push(arg);
+            } else {
+                rest.push(arg);
+            }
+        }
+        rest.append(&mut overrides);
+        cmd.args = rest;
+    }
+
     let _ = cfg;
     Ok(cmd.finish())
 }
@@ -1077,6 +1103,32 @@ mod tests {
         let sel = selection(&broken, "opencode", "acme", &m);
         let err = build(&cfg, &sel).unwrap_err().to_string();
         assert!(err.contains("npm"), "{err}");
+    }
+
+    #[test]
+    fn codex_config_overrides_follow_subcommands() {
+        let (_d, cfg) = fixture();
+        let m = Model::new("acme-large".into());
+        for tail in [
+            vec!["resume", "thread-id"],
+            vec!["exec", "resume", "thread-id", "hello"],
+        ] {
+            let mut sel = selection(&cfg, "codex", "acme", &m);
+            sel.passthrough = tail.iter().map(|s| s.to_string()).collect();
+            sel.passthrough
+                .extend(["-c".into(), "model_reasoning_effort=\"high\"".into()]);
+            let args = args_of(&build(&cfg, &sel).unwrap());
+            let last = args.iter().position(|s| s == tail.last().unwrap()).unwrap();
+            let provider = args
+                .iter()
+                .position(|s| s == "model_provider=\"fastpick\"")
+                .unwrap();
+            assert!(
+                provider > last,
+                "provider must reach the subcommand: {args:?}"
+            );
+            assert_eq!(args.last().unwrap(), "model_reasoning_effort=\"high\"");
+        }
     }
 
     #[test]
